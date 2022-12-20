@@ -1,0 +1,32 @@
+diff --git a/libs/zwin32/src/dxgi.zig b/libs/zwin32/src/dxgi.zig
+index 398e03d..300b9bb 100644
+--- a/libs/zwin32/src/dxgi.zig
++++ b/libs/zwin32/src/dxgi.zig
+@@ -1043,13 +1043,26 @@ pub const IFactory2 = extern struct {
+     pub fn Methods(comptime T: type) type {
+         return extern struct {
+             pub usingnamespace IFactory1.Methods(T);
++            pub inline fn CreateSwapChainForHwnd(
++                self: *T,
++                device: *IUnknown,
++                hwnd: HWND,
++                desc: *SWAP_CHAIN_DESC1,
++                fullscreenDesc: ?*SWAP_CHAIN_FULLSCREEN_DESC,
++                restrictToOutput: ?*IOutput,
++                swapchain: *?*ISwapChain1,
++            ) HRESULT {
++                return @ptrCast(*const IFactory2.VTable, self.v)
++                    .CreateSwapChainForHwnd(@ptrCast(*IFactory2, self), device, hwnd, desc, fullscreenDesc, restrictToOutput, swapchain);
++            }
++
+         };
+     }
+ 
+     pub const VTable = extern struct {
+         base: IFactory1.VTable,
+         IsWindowedStereoEnabled: *anyopaque,
+-        CreateSwapChainForHwnd: *anyopaque,
++        CreateSwapChainForHwnd: *const fn (*IFactory2, *IUnknown, HWND, *SWAP_CHAIN_DESC1, ?*SWAP_CHAIN_FULLSCREEN_DESC, ?*IOutput, *?*ISwapChain1) callconv(WINAPI) HRESULT,
+         CreateSwapChainForCoreWindow: *anyopaque,
+         GetSharedResourceAdapterLuid: *anyopaque,
+         RegisterStereoStatusWindow: *anyopaque,

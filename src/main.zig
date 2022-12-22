@@ -116,7 +116,6 @@ const DescriptorPool = struct {
             .map = std.StaticBitSet(descriptors_per_heap).initEmpty()
         };
         var heaps = std.ArrayList(HeapWithMap).init(allocator);
-        errdefer heaps.deinit();
         try heaps.append(h);
         return DescriptorPool {
             .heaps = heaps,
@@ -196,114 +195,194 @@ const DescriptorPool = struct {
     }
 };
 
-const ResourceHandle = struct {
+const ObjectHandle = struct {
     index: u32,
     generation: u32
 };
 
-const ResourcePool = struct {
-    const Resource = struct {
-        resource: ?*d3d12.IResource,
-        state: d3d12.RESOURCE_STATES,
-        desc: d3d12.RESOURCE_DESC
-    };
+fn ObjectPool(comptime T: type) type {
+    return struct {
+        const Self = @This();
 
-    const Data = struct {
-        resource: Resource,
-        generation: u32
-    };
-
-    data: std.ArrayList(Data),
-
-    fn init(allocator: std.mem.Allocator) !ResourcePool {
-        var data = std.ArrayList(Data).init(allocator);
-        errdefer data.deinit();
-        const dummy_desc = std.mem.zeroes(d3d12.RESOURCE_DESC);
-        const dummy = Data {
-            .resource = Resource {
-                .resource = null,
-                .state = d3d12.RESOURCE_STATE_COMMON,
-                .desc = dummy_desc
-            },
-            .generation = 0
+        const Data = struct {
+            object: ?T,
+            generation: u32
         };
-        try data.append(dummy);
-        return ResourcePool {
-            .data = data
-        };
-    }
 
-    fn deinit(self: *ResourcePool) void {
-        for (self.data.items) |d| {
-            if (d.resource.resource) |res|
-                _ = res.Release();
+        data: std.ArrayList(Data),
+
+        fn init(allocator: std.mem.Allocator) !Self {
+            var data = std.ArrayList(Data).init(allocator);
+            const dummy = Data {
+                .object = null,
+                .generation = 0
+            };
+            try data.append(dummy);
+            return Self {
+                .data = data
+            };
         }
-        self.data.deinit();
-    }
 
-    fn isValid(self: *ResourcePool, handle: ResourceHandle) bool {
-        return handle.index > 0
-            and handle.index < self.data.items.len
-            and handle.generation > 0
-            and handle.generation == self.data.items[handle.index].generation
-            and self.data.items[handle.index].resource.resource != null;
-    }
-
-    fn lookup(self: *ResourcePool, handle: ResourceHandle) ?Resource {
-        if (self.isValid(handle)) {
-            return self.data.items[handle.index].resource;
+        fn deinit(self: *Self) void {
+            for (self.data.items) |*d| {
+                if (d.object) |*object|
+                    object.release();
+            }
+            self.data.deinit();
         }
-        return null;
-    }
 
-    // add() may invalidate the result
-    fn lookupRef(self: *ResourcePool, handle: ResourceHandle) ?*Resource {
-        if (self.isValid(handle)) {
-            return &self.data.items[handle.index].resource;
+        fn isValid(self: *Self, handle: ObjectHandle) bool {
+            return handle.index > 0
+                and handle.index < self.data.items.len
+                and handle.generation > 0
+                and handle.generation == self.data.items[handle.index].generation
+                and self.data.items[handle.index].object != null;
         }
-        return null;
-    }
 
-    fn add(self: *ResourcePool, resource: *d3d12.IResource, state: d3d12.RESOURCE_STATES) !ResourceHandle {
-        const count = self.data.items.len;
-        var index: u32 = 1;
-        while (index < count) : (index += 1) {
-            if (self.data.items[index].resource.resource == null)
-                break;
+        fn lookup(self: *Self, handle: ObjectHandle) ?T {
+            if (self.isValid(handle)) {
+                return self.data.items[handle.index].object;
+            }
+            return null;
         }
-        const res = Resource {
+
+        // add() may invalidate the result
+        fn lookupRef(self: *Self, handle: ObjectHandle) ?*T {
+            if (self.isValid(handle)) {
+                return &self.data.items[handle.index].object.?;
+            }
+            return null;
+        }
+
+        fn add(self: *Self, object: T) !ObjectHandle {
+            const count = self.data.items.len;
+            var index: u32 = 1;
+            while (index < count) : (index += 1) {
+                if (self.data.items[index].object == null)
+                    break;
+            }
+            if (index < count) {
+                self.data.items[index].object = object;
+                var generation = &self.data.items[index].generation;
+                generation.* +%= 1;
+                if (generation.* == 0)
+                    generation.* = 1;
+                return ObjectHandle {
+                    .index = index,
+                    .generation = generation.*
+                };
+            } else {
+                try self.data.append(Data {
+                    .object = object,
+                    .generation = 1
+                });
+                return ObjectHandle {
+                    .index = @intCast(u32, self.data.items.len) - 1,
+                    .generation = 1
+                };
+            }
+        }
+
+        fn release(self: *Self, handle: ObjectHandle) void {
+            var object = self.lookupRef(handle);
+            if (object != null) {
+                object.?.release();
+                self.data.items[handle.index].object = null;
+            }
+        }
+    };
+}
+
+const Resource = struct {
+    resource: *d3d12.IResource,
+    state: d3d12.RESOURCE_STATES,
+    desc: d3d12.RESOURCE_DESC,
+
+    fn addToPool(pool: *ObjectPool(Resource), resource: *d3d12.IResource, state: d3d12.RESOURCE_STATES) !ObjectHandle {
+        return try pool.add(Resource {
             .resource = resource,
             .state = state,
             .desc = resource.GetDesc()
-        };
-        if (index < count) {
-            self.data.items[index].resource = res;
-            var generation = &self.data.items[index].generation;
-            generation.* +%= 1;
-            if (generation.* == 0)
-                generation.* = 1;
-            return ResourceHandle {
-                .index = index,
-                .generation = generation.*
-            };
-        } else {
-            try self.data.append(Data {
-                .resource = res,
-                .generation = 1
-            });
-            return ResourceHandle {
-                .index = @intCast(u32, self.data.items.len) - 1,
-                .generation = 1
-            };
-        }
+        });
     }
 
-    fn release(self: *ResourcePool, handle: ResourceHandle) void {
-        var resource = self.lookupRef(handle);
-        if (resource != null) {
-            _ = resource.?.resource.?.Release();
-            resource.?.resource = null;
+    fn release(self: *Resource) void {
+        _ = self.resource.Release();
+    }
+};
+
+const PipelineType = enum {
+    Graphics,
+    Compute,
+};
+
+const Pipeline = struct {
+    pso: *d3d12.IPipelineState,
+    rs: *d3d12.IRootSignature,
+    ptype: PipelineType,
+
+    fn addToPool(pool: *ObjectPool(Pipeline), pso: *d3d12.IPipelineState, rs: *d3d12.IRootSignature, ptype: PipelineType) !ObjectHandle {
+        return try pool.add(Pipeline {
+            .pso = pso,
+            .rs = rs,
+            .ptype = ptype
+        });
+    }
+
+    fn release(self: *Resource) void {
+        _ = self.pso.Release();
+        _ = self.rs.Release();
+    }
+
+    fn graphicsPipelineSha(pso_desc: *d3d12.GRAPHICS_PIPELINE_STATE_DESC, result: *[32]u8) void {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        if (pso_desc.VS.pShaderBytecode != null) {
+            hasher.update(@ptrCast([*]const u8, pso_desc.VS.pShaderBytecode.?)[0..pso_desc.VS.BytecodeLength]);
         }
+        if (pso_desc.PS.pShaderBytecode != null) {
+            hasher.update(@ptrCast([*]const u8, pso_desc.PS.pShaderBytecode.?)[0..pso_desc.PS.BytecodeLength]);
+        }
+        if (pso_desc.DS.pShaderBytecode != null) {
+            hasher.update(@ptrCast([*]const u8, pso_desc.DS.pShaderBytecode.?)[0..pso_desc.DS.BytecodeLength]);
+        }
+        if (pso_desc.HS.pShaderBytecode != null) {
+            hasher.update(@ptrCast([*]const u8, pso_desc.HS.pShaderBytecode.?)[0..pso_desc.HS.BytecodeLength]);
+        }
+        if (pso_desc.GS.pShaderBytecode != null) {
+            hasher.update(@ptrCast([*]const u8, pso_desc.GS.pShaderBytecode.?)[0..pso_desc.GS.BytecodeLength]);
+        }
+        hasher.update(std.mem.asBytes(&pso_desc.BlendState));
+        hasher.update(std.mem.asBytes(&pso_desc.SampleMask));
+        hasher.update(std.mem.asBytes(&pso_desc.RasterizerState));
+        hasher.update(std.mem.asBytes(&pso_desc.DepthStencilState));
+        hasher.update(std.mem.asBytes(&pso_desc.InputLayout.NumElements));
+        if (pso_desc.InputLayout.pInputElementDescs) |elements| {
+            var i: u32 = 0;
+            while (i < pso_desc.InputLayout.NumElements) : (i += 1) {
+                hasher.update(std.mem.asBytes(&elements[i].Format));
+                hasher.update(std.mem.asBytes(&elements[i].InputSlot));
+                hasher.update(std.mem.asBytes(&elements[i].AlignedByteOffset));
+                hasher.update(std.mem.asBytes(&elements[i].InputSlotClass));
+                hasher.update(std.mem.asBytes(&elements[i].InstanceDataStepRate));
+            }
+        }
+        hasher.update(std.mem.asBytes(&pso_desc.IBStripCutValue));
+        hasher.update(std.mem.asBytes(&pso_desc.PrimitiveTopologyType));
+        hasher.update(std.mem.asBytes(&pso_desc.NumRenderTargets));
+        hasher.update(std.mem.asBytes(&pso_desc.RTVFormats));
+        hasher.update(std.mem.asBytes(&pso_desc.DSVFormat));
+        hasher.update(std.mem.asBytes(&pso_desc.SampleDesc));
+        hasher.update(std.mem.asBytes(&pso_desc.Flags));
+        hasher.final(result);
+    }
+
+    fn computePipelineSha(pso_desc: *d3d12.COMPUTE_PIPELINE_STATE_DESC, result: *[32]u8) void {
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        if (pso_desc.CS.pShaderBytecode != null) {
+            hasher.update(@ptrCast([*]const u8, pso_desc.CS.pShaderBytecode.?)[0..pso_desc.CS.BytecodeLength]);
+        }
+        hasher.update(std.mem.asBytes(&pso_desc.Flags));
+        hasher.final(result);
     }
 };
 
@@ -315,12 +394,12 @@ const Fw = struct {
     const transition_resource_barrier_pool_size = 64;
 
     const SwapchainBuffer = struct {
-        handle: ResourceHandle,
+        handle: ObjectHandle,
         descriptor: Descriptor
     };
 
     const TransitionResourceBarrier = struct {
-        resource: ResourceHandle,
+        resource_handle: ObjectHandle,
         state_before: d3d12.RESOURCE_STATES,
         state_after: d3d12.RESOURCE_STATES
     };
@@ -347,7 +426,7 @@ const Fw = struct {
         current_frame_slot: u32,
         current_back_buffer_index: u32,
         present_allow_tearing_supported: bool,
-        resource_pool: ResourcePool,
+        resource_pool: ObjectPool(Resource),
         transition_resource_barriers: []TransitionResourceBarrier,
         trb_next: u32,
     };
@@ -555,7 +634,7 @@ const Fw = struct {
         d.rtv_pool = try DescriptorPool.init(allocator, device, .RTV, d3d12.DESCRIPTOR_HEAP_FLAG_NONE);
         errdefer d.rtv_pool.deinit();
 
-        d.resource_pool = try ResourcePool.init(allocator);
+        d.resource_pool = try ObjectPool(Resource).init(allocator);
         errdefer d.resource_pool.deinit();
 
         d.transition_resource_barriers = try allocator.alloc(TransitionResourceBarrier, transition_resource_barrier_pool_size);
@@ -611,15 +690,18 @@ const Fw = struct {
                     }
                 }
             };
+            const handle = blk: {
+                errdefer _ = res.Release();
+                break :blk try Resource.addToPool(&self.d.resource_pool, res, d3d12.RESOURCE_STATE_PRESENT);
+            };
             swapchain_buffers[index] = SwapchainBuffer {
-                .handle = try self.d.resource_pool.add(res, d3d12.RESOURCE_STATE_PRESENT),
+                .handle = handle,
                 .descriptor = try self.d.rtv_pool.allocate(1)
             };
             self.d.device.CreateRenderTargetView(res,
                                                  rtDesc,
                                                  swapchain_buffers[index].descriptor.cpu_handle);
         }
-        errdefer for (swapchain_buffers) |buf| { _ = buf.Release(); };
         self.d.swapchain_buffers = swapchain_buffers;
         self.d.current_back_buffer_index = self.d.swapchain.GetCurrentBackBufferIndex();
     }
@@ -643,8 +725,8 @@ const Fw = struct {
         }
     }
 
-    fn addTransitionBarrier(self: *Fw, handle: ResourceHandle, state_after: d3d12.RESOURCE_STATES) void {
-        var res = self.d.resource_pool.lookupRef(handle);
+    fn addTransitionBarrier(self: *Fw, resource_handle: ObjectHandle, state_after: d3d12.RESOURCE_STATES) void {
+        var res = self.d.resource_pool.lookupRef(resource_handle);
         if (res == null)
             return;
 
@@ -653,7 +735,7 @@ const Fw = struct {
                 self.flushTransitionBarriers();
 
             self.d.transition_resource_barriers[self.d.trb_next] = TransitionResourceBarrier {
-                .resource = handle,
+                .resource_handle = resource_handle,
                 .state_before = res.?.state,
                 .state_after = state_after
             };
@@ -666,14 +748,14 @@ const Fw = struct {
         var barriers: [transition_resource_barrier_pool_size]d3d12.RESOURCE_BARRIER = undefined;
         var count: u32 = 0;
         for (self.d.transition_resource_barriers) |*trb| {
-            if (!self.d.resource_pool.isValid(trb.resource))
+            if (!self.d.resource_pool.isValid(trb.resource_handle))
                 continue;
             barriers[count] = .{
                 .Type = .TRANSITION,
                 .Flags = d3d12.RESOURCE_BARRIER_FLAG_NONE,
                 .u = .{
                     .Transition = .{
-                        .pResource = self.d.resource_pool.lookupRef(trb.resource).?.resource.?,
+                        .pResource = self.d.resource_pool.lookupRef(trb.resource_handle).?.resource,
                         .Subresource = d3d12.RESOURCE_BARRIER_ALL_SUBRESOURCES,
                         .StateBefore = trb.state_before,
                         .StateAfter = trb.state_after,
@@ -824,6 +906,11 @@ pub fn main() !void {
 
     while (fw.handleWindowEvents()) {
         try fw.beginFrame();
+        // var psodesc = std.mem.zeroes(d3d12.GRAPHICS_PIPELINE_STATE_DESC);
+        // var sha: [32]u8 = undefined;
+        // Pipeline.graphicsPipelineSha(&psodesc, &sha);
+        // var csdesc = std.mem.zeroes(d3d12.COMPUTE_PIPELINE_STATE_DESC);
+        // Pipeline.computePipelineSha(&csdesc, &sha);
         try fw.endFrame();
     }
 

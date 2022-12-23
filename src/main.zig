@@ -229,7 +229,7 @@ fn ObjectPool(comptime T: type) type {
         fn deinit(self: *Self) void {
             for (self.data.items) |*d| {
                 if (d.object) |*object|
-                    object.release();
+                    object.poolRelease();
             }
             self.data.deinit();
         }
@@ -286,10 +286,10 @@ fn ObjectPool(comptime T: type) type {
             }
         }
 
-        fn release(self: *Self, handle: ObjectHandle) void {
+        fn remove(self: *Self, handle: ObjectHandle) void {
             var object = self.lookupRef(handle);
             if (object != null) {
-                object.?.release();
+                object.?.poolRelease();
                 self.data.items[handle.index].object = null;
             }
         }
@@ -309,22 +309,22 @@ const Resource = struct {
         });
     }
 
-    fn release(self: *Resource) void {
+    fn poolRelease(self: *Resource) void {
         _ = self.resource.Release();
     }
 };
 
-const PipelineType = enum {
-    Graphics,
-    Compute,
-};
-
 const Pipeline = struct {
+    const Type = enum {
+        Graphics,
+        Compute,
+    };
+
     pso: *d3d12.IPipelineState,
     rs: *d3d12.IRootSignature,
-    ptype: PipelineType,
+    ptype: Type,
 
-    fn addToPool(pool: *ObjectPool(Pipeline), pso: *d3d12.IPipelineState, rs: *d3d12.IRootSignature, ptype: PipelineType) !ObjectHandle {
+    fn addToPool(pool: *ObjectPool(Pipeline), pso: *d3d12.IPipelineState, rs: *d3d12.IRootSignature, ptype: Type) !ObjectHandle {
         return try pool.add(Pipeline {
             .pso = pso,
             .rs = rs,
@@ -332,12 +332,14 @@ const Pipeline = struct {
         });
     }
 
-    fn release(self: *Resource) void {
+    fn poolRelease(self: *Resource) void {
         _ = self.pso.Release();
         _ = self.rs.Release();
     }
 
-    fn graphicsPipelineSha(pso_desc: *d3d12.GRAPHICS_PIPELINE_STATE_DESC, result: *[32]u8) void {
+    const sha_length = 32;
+
+    fn getGraphicsPipelineSha(pso_desc: *d3d12.GRAPHICS_PIPELINE_STATE_DESC, result: *[sha_length]u8) void {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         if (pso_desc.VS.pShaderBytecode != null) {
             hasher.update(@ptrCast([*]const u8, pso_desc.VS.pShaderBytecode.?)[0..pso_desc.VS.BytecodeLength]);
@@ -379,7 +381,7 @@ const Pipeline = struct {
         hasher.final(result);
     }
 
-    fn computePipelineSha(pso_desc: *d3d12.COMPUTE_PIPELINE_STATE_DESC, result: *[32]u8) void {
+    fn getComputePipelineSha(pso_desc: *d3d12.COMPUTE_PIPELINE_STATE_DESC, result: *[sha_length]u8) void {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         if (pso_desc.CS.pShaderBytecode != null) {
             hasher.update(@ptrCast([*]const u8, pso_desc.CS.pShaderBytecode.?)[0..pso_desc.CS.BytecodeLength]);
@@ -387,6 +389,49 @@ const Pipeline = struct {
         hasher.update(std.mem.asBytes(&pso_desc.Flags));
         hasher.final(result);
     }
+
+    const Cache = struct {
+        allocator: std.mem.Allocator,
+        data: std.StringHashMap(ObjectHandle),
+
+        fn init(allocator: std.mem.Allocator) Cache {
+            return Cache {
+                .allocator = allocator,
+                .data = std.StringHashMap(ObjectHandle).init(allocator)
+            };
+        }
+
+        fn deinit(self: *Cache) void {
+            var it = self.data.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.data.deinit();
+        }
+
+        fn add(self: *Cache, sha: []const u8, handle: ObjectHandle) !void {
+            var v = try self.data.getOrPut(sha);
+            if (!v.found_existing) {
+                var key = try self.allocator.alloc(u8, sha.len);
+                std.mem.copy(u8, key, sha);
+                v.key_ptr.* = key;
+                v.value_ptr.* = handle;
+            }
+        }
+
+        fn remove(self: *Cache, sha: []const u8) void {
+            const kv = self.data.fetchRemove(sha) orelse return;
+            self.allocator.free(kv.key);
+        }
+
+        fn count(self: *const Cache) u32 {
+            return self.data.count();
+        }
+
+        fn get(self: *const Cache, sha: []const u8) ?ObjectHandle {
+            return self.data.get(sha);
+        }
+    };
 };
 
 const Fw = struct {
@@ -656,7 +701,7 @@ const Fw = struct {
     fn deinit(self: *Fw, allocator: std.mem.Allocator) void {
         self.waitGpu();
         for (self.d.swapchain_buffers) |swapchain_buffer| {
-            self.d.resource_pool.release(swapchain_buffer.handle);
+            self.d.resource_pool.remove(swapchain_buffer.handle);
         }
         allocator.free(self.d.transition_resource_barriers);
         self.d.resource_pool.deinit();
@@ -782,7 +827,7 @@ const Fw = struct {
             std.debug.print("Resizing swapchain {}x{}\n", .{self.d.swapchain_width, self.d.swapchain_height});
             self.waitGpu();
             for (self.d.swapchain_buffers) |*swapchain_buffer| {
-                self.d.resource_pool.release(swapchain_buffer.handle);
+                self.d.resource_pool.remove(swapchain_buffer.handle);
                 self.d.rtv_pool.release(swapchain_buffer.descriptor, 1);
             }
             try zwin32.hrErrorOnFail(self.d.swapchain.ResizeBuffers(swapchain_buffer_count,
@@ -907,15 +952,26 @@ pub fn main() !void {
     var fw = try Fw.init(1280, 720, "zig test", allocator);
     defer fw.deinit(allocator);
 
+    var p = Pipeline.Cache.init(allocator);
     while (fw.handleWindowEvents()) {
         try fw.beginFrame();
-        // var psodesc = std.mem.zeroes(d3d12.GRAPHICS_PIPELINE_STATE_DESC);
-        // var sha: [32]u8 = undefined;
-        // Pipeline.graphicsPipelineSha(&psodesc, &sha);
-        // var csdesc = std.mem.zeroes(d3d12.COMPUTE_PIPELINE_STATE_DESC);
-        // Pipeline.computePipelineSha(&csdesc, &sha);
+        var psodesc = std.mem.zeroes(d3d12.GRAPHICS_PIPELINE_STATE_DESC);
+        {
+            var sha: [Pipeline.sha_length]u8 = undefined;
+            Pipeline.getGraphicsPipelineSha(&psodesc, &sha);
+            var h = std.mem.zeroes(ObjectHandle);
+            try p.add(&sha, h);
+            var csdesc = std.mem.zeroes(d3d12.COMPUTE_PIPELINE_STATE_DESC);
+            Pipeline.getComputePipelineSha(&csdesc, &sha);
+        }
+        {
+            var sha: [Pipeline.sha_length]u8 = undefined;
+            Pipeline.getGraphicsPipelineSha(&psodesc, &sha);
+            p.remove(&sha);
+        }
         try fw.endFrame();
     }
+    p.deinit();
 
     std.debug.print("Exiting\n", .{});
 }

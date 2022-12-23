@@ -5,6 +5,9 @@ const dxgi = zwin32.dxgi;
 const d3d12 = zwin32.d3d12;
 const d3d12d = zwin32.d3d12d;
 
+const color_vs = @embedFile("shaders/color.vs.cso");
+const color_ps = @embedFile("shaders/color.ps.cso");
+
 const imgui = @cImport({
     @cDefine("CIMGUI_DEFINE_ENUMS_AND_STRUCTS", "");
     @cDefine("CIMGUI_NO_EXPORT", "");

@@ -9,6 +9,9 @@ pub fn build(b: *std.build.Builder) void {
 
     exe.addPackage(zwin32.pkg);
 
+    const dxc_step = buildShaders(b);
+    exe.step.dependOn(dxc_step);
+
     exe.addIncludePath("libs");
     const imguiDir = "libs/imgui";
     exe.addIncludePath(imguiDir);
@@ -41,4 +44,52 @@ pub fn build(b: *std.build.Builder) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&exe_tests.step);
+}
+
+fn buildShaders(b: *std.build.Builder) *std.build.Step {
+    const dxc_step = b.step("dxc", "Build shaders");
+
+    var dxc_command = makeDxcCmd(
+        "color.hlsl",
+        "vsMain",
+        "color.vs.cso",
+        "vs",
+        ""
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "color.hlsl",
+        "psMain",
+        "color.ps.cso",
+        "ps",
+        ""
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    return dxc_step;
+}
+
+fn makeDxcCmd(
+    comptime input_path: []const u8,
+    comptime entry_point: []const u8,
+    comptime output_filename: []const u8,
+    comptime profile: []const u8,
+    comptime define: []const u8,
+) [7][]const u8 {
+    const shader_ver = "6_0";
+    const shader_dir = thisDir() ++ "/src/shaders/";
+    return [7][]const u8 {
+        "dxc.exe",
+        shader_dir ++ input_path,
+        "/E " ++ entry_point,
+        "/Fo " ++ shader_dir ++ output_filename,
+        "/Fc " ++ shader_dir ++ output_filename ++ ".txt",
+        "/T " ++ profile ++ "_" ++ shader_ver,
+        if (define.len == 0) "" else "/D " ++ define,
+    };
+}
+
+inline fn thisDir() []const u8 {
+    return comptime std.fs.path.dirname(@src().file) orelse ".";
 }

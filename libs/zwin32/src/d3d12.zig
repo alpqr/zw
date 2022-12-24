@@ -324,7 +324,7 @@ pub const ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED: ROOT_SIGNATURE_
 pub const ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED: ROOT_SIGNATURE_FLAGS = 0x800;
 
 pub const ROOT_SIGNATURE_DESC = extern struct {
-    NumParamenters: UINT,
+    NumParameters: UINT,
     pParameters: ?[*]const ROOT_PARAMETER,
     NumStaticSamplers: UINT,
     pStaticSamplers: ?[*]const STATIC_SAMPLER_DESC,
@@ -376,7 +376,7 @@ pub const ROOT_PARAMETER1 = extern struct {
 };
 
 pub const ROOT_SIGNATURE_DESC1 = extern struct {
-    NumParamenters: UINT,
+    NumParameters: UINT,
     pParameters: ?[*]const ROOT_PARAMETER1,
     NumStaticSamplers: UINT,
     pStaticSamplers: ?[*]const STATIC_SAMPLER_DESC,

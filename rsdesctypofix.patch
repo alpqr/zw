@@ -1,0 +1,13 @@
+diff --git a/libs/zwin32/src/d3d12.zig b/libs/zwin32/src/d3d12.zig
+index 4ba905d..0b345a0 100644
+--- a/libs/zwin32/src/d3d12.zig
++++ b/libs/zwin32/src/d3d12.zig
+@@ -324,7 +324,7 @@ pub const ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED: ROOT_SIGNATURE_
+ pub const ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED: ROOT_SIGNATURE_FLAGS = 0x800;
+ 
+ pub const ROOT_SIGNATURE_DESC = extern struct {
+-    NumParamenters: UINT,
++    NumParameters: UINT,
+     pParameters: ?[*]const ROOT_PARAMETER,
+     NumStaticSamplers: UINT,
+     pStaticSamplers: ?[*]const STATIC_SAMPLER_DESC,

@@ -1,0 +1,13 @@
+diff --git a/libs/zwin32/src/d3d12.zig b/libs/zwin32/src/d3d12.zig
+index 0b345a0..559913e 100644
+--- a/libs/zwin32/src/d3d12.zig
++++ b/libs/zwin32/src/d3d12.zig
+@@ -376,7 +376,7 @@ pub const ROOT_PARAMETER1 = extern struct {
+ };
+ 
+ pub const ROOT_SIGNATURE_DESC1 = extern struct {
+-    NumParamenters: UINT,
++    NumParameters: UINT,
+     pParameters: ?[*]const ROOT_PARAMETER1,
+     NumStaticSamplers: UINT,
+     pStaticSamplers: ?[*]const STATIC_SAMPLER_DESC,

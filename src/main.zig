@@ -19,8 +19,6 @@ pub fn main() !void {
     defer fw.deinit(allocator);
 
     var device = fw.getDevice();
-    var pipeline_pool = try zr.ObjectPool(zr.Pipeline).init(allocator);
-    errdefer pipeline_pool.deinit();
     var pipeline_cache = zr.Pipeline.Cache.init(allocator);
     errdefer pipeline_cache.deinit();
 
@@ -113,7 +111,7 @@ pub fn main() !void {
                                                                     &d3d12.IID_IPipelineState,
                                                                     @ptrCast(*?*anyopaque, &pso)));
 
-        pipeline_handle = try zr.Pipeline.addToPool(&pipeline_pool, pso, rs, zr.Pipeline.Type.Graphics);
+        pipeline_handle = try zr.Pipeline.addToPool(fw.getPipelinePool(), pso, rs, zr.Pipeline.Type.Graphics);
         try pipeline_cache.add(&sha, pipeline_handle);
     }
 
@@ -125,25 +123,13 @@ pub fn main() !void {
         c.OMSetRenderTargets(1, &[_]d3d12.CPU_DESCRIPTOR_HANDLE { rt_cpu_handle }, w32.TRUE, null);
         c.ClearRenderTargetView(rt_cpu_handle, &[4]f32 { 0.0, 1.0, 0.0, 1.0 }, 0, null);
 
-        // var psodesc = std.mem.zeroes(d3d12.GRAPHICS_PIPELINE_STATE_DESC);
-        // {
-        //     var sha: [Pipeline.sha_length]u8 = undefined;
-        //     Pipeline.getGraphicsPipelineSha(&psodesc, &sha);
-        //     var h = std.mem.zeroes(ObjectHandle);
-        //     try p.add(&sha, h);
-        //     var csdesc = std.mem.zeroes(d3d12.COMPUTE_PIPELINE_STATE_DESC);
-        //     Pipeline.getComputePipelineSha(&csdesc, &sha);
-        // }
-        // {
-        //     var sha: [Pipeline.sha_length]u8 = undefined;
-        //     Pipeline.getGraphicsPipelineSha(&psodesc, &sha);
-        //     p.remove(&sha);
-        // }
+        fw.setPipeline(pipeline_handle);
+        c.IASetPrimitiveTopology(.TRIANGLELIST);
+
         try fw.endFrame();
     }
 
     std.debug.print("Exiting\n", .{});
 
     pipeline_cache.deinit();
-    pipeline_pool.deinit();
 }

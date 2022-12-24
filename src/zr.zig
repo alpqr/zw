@@ -75,7 +75,7 @@ pub const DescriptorHeap = struct {
         self.size -= count;
     }
 
-    pub fn at(self: *DescriptorHeap, index: u32) Descriptor {
+    pub fn at(self: *const DescriptorHeap, index: u32) Descriptor {
         const start_offset = index * self.descriptor_byte_size;
 
         const cpu_handle = d3d12.CPU_DESCRIPTOR_HANDLE { .ptr = self.base.cpu_handle.ptr + start_offset };
@@ -238,7 +238,7 @@ pub fn ObjectPool(comptime T: type) type {
             self.data.deinit();
         }
 
-        pub fn isValid(self: *Self, handle: ObjectHandle) bool {
+        pub fn isValid(self: *const Self, handle: ObjectHandle) bool {
             return handle.index > 0
                 and handle.index < self.data.items.len
                 and handle.generation > 0
@@ -246,7 +246,7 @@ pub fn ObjectPool(comptime T: type) type {
                 and self.data.items[handle.index].object != null;
         }
 
-        pub fn lookup(self: *Self, handle: ObjectHandle) ?T {
+        pub fn lookup(self: *const Self, handle: ObjectHandle) ?T {
             if (self.isValid(handle)) {
                 return self.data.items[handle.index].object;
             }
@@ -343,7 +343,7 @@ pub const Pipeline = struct {
 
     pub const sha_length = 32;
 
-    pub fn getGraphicsPipelineSha(pso_desc: *d3d12.GRAPHICS_PIPELINE_STATE_DESC, result: *[sha_length]u8) void {
+    pub fn getGraphicsPipelineSha(pso_desc: *const d3d12.GRAPHICS_PIPELINE_STATE_DESC, result: *[sha_length]u8) void {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         if (pso_desc.VS.pShaderBytecode != null) {
             hasher.update(@ptrCast([*]const u8, pso_desc.VS.pShaderBytecode.?)[0..pso_desc.VS.BytecodeLength]);
@@ -385,7 +385,7 @@ pub const Pipeline = struct {
         hasher.final(result);
     }
 
-    pub fn getComputePipelineSha(pso_desc: *d3d12.COMPUTE_PIPELINE_STATE_DESC, result: *[sha_length]u8) void {
+    pub fn getComputePipelineSha(pso_desc: *const d3d12.COMPUTE_PIPELINE_STATE_DESC, result: *[sha_length]u8) void {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         if (pso_desc.CS.pShaderBytecode != null) {
             hasher.update(@ptrCast([*]const u8, pso_desc.CS.pShaderBytecode.?)[0..pso_desc.CS.BytecodeLength]);
@@ -486,8 +486,10 @@ pub const Fw = struct {
         current_back_buffer_index: u32,
         present_allow_tearing_supported: bool,
         resource_pool: ObjectPool(Resource),
+        pipeline_pool: ObjectPool(Pipeline),
         transition_resource_barriers: []TransitionResourceBarrier,
         trb_next: u32,
+        current_pipeline_handle: ObjectHandle,
     };
     d: *Data,
 
@@ -705,11 +707,16 @@ pub const Fw = struct {
         d.resource_pool = try ObjectPool(Resource).init(allocator);
         errdefer d.resource_pool.deinit();
 
+        d.pipeline_pool = try ObjectPool(Pipeline).init(allocator);
+        errdefer d.pipeline_pool.deinit();
+
         d.transition_resource_barriers = try allocator.alloc(TransitionResourceBarrier, transition_resource_barrier_pool_size);
         errdefer allocator.free(d.transition_resource_barriers);
         d.trb_next = 0;
 
         d.current_frame_slot = 0;
+
+        d.current_pipeline_handle = ObjectHandle.invalid();
 
         var self = Fw {
             .d = d
@@ -724,6 +731,7 @@ pub const Fw = struct {
             self.d.resource_pool.remove(swapchain_buffer.handle);
         }
         allocator.free(self.d.transition_resource_barriers);
+        self.d.pipeline_pool.deinit();
         self.d.resource_pool.deinit();
         self.d.rtv_pool.deinit();
         _ = self.d.cmdlist.Release();
@@ -794,21 +802,18 @@ pub const Fw = struct {
     }
 
     pub fn addTransitionBarrier(self: *Fw, resource_handle: ObjectHandle, state_after: d3d12.RESOURCE_STATES) void {
-        var res = self.d.resource_pool.lookupRef(resource_handle);
-        if (res == null)
-            return;
-
-        if (state_after != res.?.state) {
+        var res = self.d.resource_pool.lookupRef(resource_handle) orelse return;
+        if (state_after != res.state) {
             if (self.d.trb_next == self.d.transition_resource_barriers.len)
                 self.flushTransitionBarriers();
 
             self.d.transition_resource_barriers[self.d.trb_next] = TransitionResourceBarrier {
                 .resource_handle = resource_handle,
-                .state_before = res.?.state,
+                .state_before = res.state,
                 .state_after = state_after
             };
             self.d.trb_next += 1;                
-            res.?.state = state_after;
+            res.state = state_after;
         }
     }
 
@@ -850,6 +855,10 @@ pub const Fw = struct {
         return &self.d.resource_pool;
     }
 
+    pub fn getPipelinePool(self: *const Fw) *ObjectPool(Pipeline) {
+        return &self.d.pipeline_pool;
+    }
+
     pub fn getCurrentFrameSlot(self: *const Fw) u32 {
         return self.d.current_frame_slot;
     }
@@ -889,6 +898,8 @@ pub const Fw = struct {
 
         self.addTransitionBarrier(self.getBackBufferObjectHandle(), d3d12.RESOURCE_STATE_RENDER_TARGET);
         self.flushTransitionBarriers();
+
+        self.resetTrackedState();
     }
 
     pub fn endFrame(self: *Fw) !void {
@@ -910,6 +921,24 @@ pub const Fw = struct {
 
         self.d.current_frame_slot = (self.d.current_frame_slot + 1) % max_frames_in_flight;
         self.d.current_back_buffer_index = self.d.swapchain.GetCurrentBackBufferIndex();
+    }
+
+    pub fn setPipeline(self: *Fw, pipeline_handle: ObjectHandle) void {
+        const pipeline = self.d.pipeline_pool.lookupRef(pipeline_handle) orelse return;
+        if (pipeline_handle.index == self.d.current_pipeline_handle.index
+                and pipeline_handle.generation == self.d.current_pipeline_handle.generation) {
+            return;
+        }
+        self.d.cmdlist.SetPipelineState(pipeline.pso);
+        switch (pipeline.ptype) {
+            .Graphics => self.d.cmdlist.SetGraphicsRootSignature(pipeline.rs),
+            .Compute => self.d.cmdlist.SetComputeRootSignature(pipeline.rs)
+        }
+        self.d.current_pipeline_handle = pipeline_handle;
+    }
+
+    pub fn resetTrackedState(self: *Fw) void {
+        self.d.current_pipeline_handle = ObjectHandle.invalid();
     }
 
     const PAINTSTRUCT = extern struct {

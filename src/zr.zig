@@ -2,6 +2,7 @@ const std = @import("std");
 const zwin32 = @import("zwin32");
 const w32 = zwin32.base;
 const dxgi = zwin32.dxgi;
+const d3d = zwin32.d3d;
 const d3d12 = zwin32.d3d12;
 const d3d12d = zwin32.d3d12d;
 
@@ -232,8 +233,9 @@ pub fn ObjectPool(comptime T: type) type {
 
         pub fn deinit(self: *Self) void {
             for (self.data.items) |*d| {
-                if (d.object) |*object|
-                    object.poolRelease();
+                if (d.object) |*object| {
+                    object.releaseResources();
+                }
             }
             self.data.deinit();
         }
@@ -291,9 +293,8 @@ pub fn ObjectPool(comptime T: type) type {
         }
 
         pub fn remove(self: *Self, handle: ObjectHandle) void {
-            var object = self.lookupRef(handle);
-            if (object != null) {
-                object.?.poolRelease();
+            if (self.lookupRef(handle)) |object| {
+                object.releaseResources();
                 self.data.items[handle.index].object = null;
             }
         }
@@ -313,7 +314,7 @@ pub const Resource = struct {
         });
     }
 
-    fn poolRelease(self: *Resource) void {
+    pub fn releaseResources(self: *Resource) void {
         _ = self.resource.Release();
     }
 };
@@ -336,7 +337,7 @@ pub const Pipeline = struct {
         });
     }
 
-    fn poolRelease(self: *Pipeline) void {
+    pub fn releaseResources(self: *Pipeline) void {
         _ = self.pso.Release();
         _ = self.rs.Release();
     }
@@ -406,11 +407,16 @@ pub const Pipeline = struct {
         }
 
         pub fn deinit(self: *Cache) void {
+            self.clear();
+            self.data.deinit();
+        }
+
+        pub fn clear(self: *Cache) void {
             var it = self.data.iterator();
             while (it.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
             }
-            self.data.deinit();
+            self.data.clearAndFree();
         }
 
         pub fn add(self: *Cache, sha: []const u8, handle: ObjectHandle) !void {
@@ -487,6 +493,7 @@ pub const Fw = struct {
         present_allow_tearing_supported: bool,
         resource_pool: ObjectPool(Resource),
         pipeline_pool: ObjectPool(Pipeline),
+        pipeline_cache: Pipeline.Cache,
         transition_resource_barriers: []TransitionResourceBarrier,
         trb_next: u32,
         current_pipeline_handle: ObjectHandle,
@@ -710,6 +717,9 @@ pub const Fw = struct {
         d.pipeline_pool = try ObjectPool(Pipeline).init(allocator);
         errdefer d.pipeline_pool.deinit();
 
+        d.pipeline_cache = Pipeline.Cache.init(allocator);
+        errdefer d.pipeline_cache.deinit();
+
         d.transition_resource_barriers = try allocator.alloc(TransitionResourceBarrier, transition_resource_barrier_pool_size);
         errdefer allocator.free(d.transition_resource_barriers);
         d.trb_next = 0;
@@ -731,6 +741,7 @@ pub const Fw = struct {
             self.d.resource_pool.remove(swapchain_buffer.handle);
         }
         allocator.free(self.d.transition_resource_barriers);
+        self.d.pipeline_cache.deinit();
         self.d.pipeline_pool.deinit();
         self.d.resource_pool.deinit();
         self.d.rtv_pool.deinit();
@@ -859,6 +870,10 @@ pub const Fw = struct {
         return &self.d.pipeline_pool;
     }
 
+    pub fn getPipelineCache(self: *const Fw) *Pipeline.Cache {
+        return &self.d.pipeline_cache;
+    }
+
     pub fn getCurrentFrameSlot(self: *const Fw) u32 {
         return self.d.current_frame_slot;
     }
@@ -939,6 +954,43 @@ pub const Fw = struct {
 
     pub fn resetTrackedState(self: *Fw) void {
         self.d.current_pipeline_handle = ObjectHandle.invalid();
+    }
+
+    pub fn lookupOrCreateGraphicsPipeline(self: *Fw,
+                                          pso_desc: *d3d12.GRAPHICS_PIPELINE_STATE_DESC,
+                                          rs_desc: *const d3d12.VERSIONED_ROOT_SIGNATURE_DESC) !ObjectHandle {
+        var sha: [Pipeline.sha_length]u8 = undefined;
+        Pipeline.getGraphicsPipelineSha(pso_desc, &sha);
+        if (self.d.pipeline_cache.get(&sha)) |pipeline_handle| {
+            return pipeline_handle;
+        }
+        var signature: *d3d.IBlob = undefined;
+        try zwin32.hrErrorOnFail(d3d12.D3D12SerializeVersionedRootSignature(rs_desc,
+                                                                            @ptrCast(*?*d3d.IBlob, &signature),
+                                                                            null));
+        defer _ = signature.Release();
+
+        const pipeline_handle = blk: {
+            var rs: *d3d12.IRootSignature = undefined;
+            try zwin32.hrErrorOnFail(self.d.device.CreateRootSignature(0,
+                                                                       signature.GetBufferPointer(),
+                                                                       signature.GetBufferSize(),
+                                                                       &d3d12.IID_IRootSignature,
+                                                                       @ptrCast(*?*anyopaque, &rs)));
+            errdefer _ = rs.Release();
+            pso_desc.pRootSignature = rs;
+
+            var pso: *d3d12.IPipelineState = undefined;
+            try zwin32.hrErrorOnFail(self.d.device.CreateGraphicsPipelineState(pso_desc,
+                                                                               &d3d12.IID_IPipelineState,
+                                                                               @ptrCast(*?*anyopaque, &pso)));
+            errdefer _ = pso.Release();
+
+            break :blk try Pipeline.addToPool(&self.d.pipeline_pool, pso, rs, Pipeline.Type.Graphics);
+        };
+
+        try self.d.pipeline_cache.add(&sha, pipeline_handle);
+        return pipeline_handle;
     }
 
     const PAINTSTRUCT = extern struct {

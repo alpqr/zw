@@ -88,9 +88,17 @@ pub fn main() !void {
     defer fw.deinit(allocator);
 
     const pipeline_handle = try create_pipeline(&fw);
+    var vbuf = try fw.createBuffer(.DEFAULT, 64);
 
+    // var s = try zr.StagingArea.init(fw.getDevice(), 1024, .READBACK);
+    // s.reset();
+    // _ = s.getBuffer();
+    // std.debug.print("{any}\n", .{s.allocate(32)});
+    // std.debug.print("{any}\n", .{s.allocate(32)});
     while (zr.Fw.handleWindowEvents()) {
         try fw.beginFrame();
+        const vbuf_res = fw.getResourcePool().lookupRef(vbuf).?;
+        _ = fw.getCurrentSmallUploadStagingArea().allocate(@intCast(u32, vbuf_res.desc.Width)).?;
 
         const c = fw.getCommandList();
         const rt_cpu_handle = fw.getBackBufferCpuDescriptorHandle();
@@ -102,6 +110,6 @@ pub fn main() !void {
 
         try fw.endFrame();
     }
-
+//    s.deinit();
     std.debug.print("Exiting\n", .{});
 }

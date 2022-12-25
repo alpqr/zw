@@ -444,6 +444,93 @@ pub const Pipeline = struct {
     };
 };
 
+pub fn alignedSize(size: u32, alignment: u32) u32 {
+    return (size + alignment - 1) & ~(alignment - 1);
+}
+
+pub const StagingArea = struct {
+    pub const alignment: u32 = 512;
+
+    pub const Allocation = struct {
+        cpu_slice: []u8,
+        gpu_addr: d3d12.GPU_VIRTUAL_ADDRESS,
+        buffer_offset: u32
+    };
+
+    buffer: *d3d12.IResource,
+    mem: Allocation,
+    size: u32,
+    capacity: u32,
+
+    pub fn init(device: *d3d12.IDevice9, capacity: u32, heap_type: d3d12.HEAP_TYPE) !StagingArea {
+        std.debug.assert(heap_type == .UPLOAD or heap_type == .READBACK);
+        var resource: *d3d12.IResource = undefined;
+        var heap_properties = std.mem.zeroes(d3d12.HEAP_PROPERTIES);
+        heap_properties.Type = heap_type;
+        try zwin32.hrErrorOnFail(device.CreateCommittedResource(
+            &heap_properties,
+            d3d12.HEAP_FLAG_NONE,
+            &.{
+                .Dimension = .BUFFER,
+                .Alignment = 0,
+                .Width = capacity,
+                .Height = 1,
+                .DepthOrArraySize = 1,
+                .MipLevels = 1,
+                .Format = .UNKNOWN,
+                .SampleDesc = .{ .Count = 1, .Quality = 0 },
+                .Layout = .ROW_MAJOR,
+                .Flags = d3d12.RESOURCE_FLAG_NONE
+            },
+            d3d12.RESOURCE_STATE_COMMON,
+            null,
+            &d3d12.IID_IResource,
+            @ptrCast(*?*anyopaque, &resource),
+        ));
+        errdefer _ = resource.Release();
+        var p: [*]u8 = undefined;
+        try zwin32.hrErrorOnFail(resource.Map(0,  &.{ .Begin = 0, .End = 0 }, @ptrCast(*?*anyopaque, &p)));
+        return StagingArea {
+            .buffer = resource,
+            .mem = .{
+                .cpu_slice = p[0..capacity],
+                .gpu_addr = resource.GetGPUVirtualAddress(),
+                .buffer_offset = 0
+            },
+            .size = 0,
+            .capacity = capacity
+        };
+    }
+
+    pub fn deinit(self: *StagingArea) void {
+        _ = self.buffer.Release();
+    }
+
+    pub fn allocate(self: *StagingArea, size: u32) ?Allocation {
+        const alloc_size = alignedSize(size, alignment);
+        if (self.size + alloc_size > self.capacity) {
+            return null;
+        }
+        const offset = self.size;
+        const cpu_slice = (self.mem.cpu_slice.ptr + offset)[0..size];
+        const gpu_addr = self.mem.gpu_addr + offset;
+        self.size += alloc_size;
+        return .{
+            .cpu_slice = cpu_slice,
+            .gpu_addr = gpu_addr,
+            .buffer_offset = offset
+        };
+    }
+
+    pub fn reset(self: *StagingArea) void {
+        self.size = 0;
+    }
+
+    pub fn getBuffer(self: *const StagingArea) *d3d12.IResource {
+        return self.buffer;
+    }
+};
+
 pub const Fw = struct {
     pub const Options = struct {
         window_width: u32 = 1280,
@@ -451,6 +538,7 @@ pub const Fw = struct {
         window_name: [*:0]const u8 = "zigapp",
         enable_debug_layer: bool = false,
         swap_interval: u32 = 1,
+        small_upload_staging_area_capacity_per_frame: u32 = 16 * 1024 * 1024,
     };
 
     pub const max_frames_in_flight = 2;
@@ -496,6 +584,7 @@ pub const Fw = struct {
         pipeline_cache: Pipeline.Cache,
         transition_resource_barriers: []TransitionResourceBarrier,
         trb_next: u32,
+        small_upload_staging_areas: [max_frames_in_flight]StagingArea,
         current_pipeline_handle: ObjectHandle,
     };
     d: *Data,
@@ -724,6 +813,12 @@ pub const Fw = struct {
         errdefer allocator.free(d.transition_resource_barriers);
         d.trb_next = 0;
 
+        for (d.small_upload_staging_areas) |_, index| {
+            d.small_upload_staging_areas[index] = try StagingArea.init(d.device,
+                                                                       d.options.small_upload_staging_area_capacity_per_frame,
+                                                                       .UPLOAD);
+        }
+
         d.current_frame_slot = 0;
 
         d.current_pipeline_handle = ObjectHandle.invalid();
@@ -739,6 +834,9 @@ pub const Fw = struct {
         self.waitGpu();
         for (self.d.swapchain_buffers) |swapchain_buffer| {
             self.d.resource_pool.remove(swapchain_buffer.handle);
+        }
+        for (self.d.small_upload_staging_areas) |*upload_staging_area| {
+            upload_staging_area.deinit();
         }
         allocator.free(self.d.transition_resource_barriers);
         self.d.pipeline_cache.deinit();
@@ -878,6 +976,10 @@ pub const Fw = struct {
         return self.d.current_frame_slot;
     }
 
+    pub fn getCurrentSmallUploadStagingArea(self: *const Fw) *StagingArea {
+        return &self.d.small_upload_staging_areas[self.d.current_frame_slot];
+    }
+
     pub fn getBackBufferCpuDescriptorHandle(self: *const Fw) d3d12.CPU_DESCRIPTOR_HANDLE {
         return self.d.swapchain_buffers[self.d.current_back_buffer_index].descriptor.cpu_handle;
     }
@@ -915,6 +1017,8 @@ pub const Fw = struct {
         self.flushTransitionBarriers();
 
         self.resetTrackedState();
+
+        self.d.small_upload_staging_areas[self.d.current_frame_slot].reset();
     }
 
     pub fn endFrame(self: *Fw) !void {
@@ -991,6 +1095,33 @@ pub const Fw = struct {
 
         try self.d.pipeline_cache.add(&sha, pipeline_handle);
         return pipeline_handle;
+    }
+
+    pub fn createBuffer(self: *Fw, heap_type: d3d12.HEAP_TYPE, size: u32) !ObjectHandle {
+        var heap_properties = std.mem.zeroes(d3d12.HEAP_PROPERTIES);
+        heap_properties.Type = heap_type;
+        var resource: *d3d12.IResource = undefined;
+        try zwin32.hrErrorOnFail(self.d.device.CreateCommittedResource(
+            &heap_properties,
+            d3d12.HEAP_FLAG_NONE,
+            &.{
+                .Dimension = .BUFFER,
+                .Alignment = 0,
+                .Width = std.math.max(1, size),
+                .Height = 1,
+                .DepthOrArraySize = 1,
+                .MipLevels = 1,
+                .Format = .UNKNOWN,
+                .SampleDesc = .{ .Count = 1, .Quality = 0 },
+                .Layout = .ROW_MAJOR,
+                .Flags = d3d12.RESOURCE_FLAG_NONE
+            },
+            d3d12.RESOURCE_STATE_COMMON,
+            null,
+            &d3d12.IID_IResource,
+            @ptrCast(*?*anyopaque, &resource)));
+        errdefer _ = resource.Release();
+        return try Resource.addToPool(&self.d.resource_pool, resource, d3d12.RESOURCE_STATE_COMMON);
     }
 
     const PAINTSTRUCT = extern struct {

@@ -573,8 +573,8 @@ pub const Fw = struct {
         frame_fence: *d3d12.IFence,
         frame_fence_event: w32.HANDLE,
         frame_fence_counter: u64,
-        cmdallocators: [max_frames_in_flight]*d3d12.ICommandAllocator,
-        cmdlist: *d3d12.IGraphicsCommandList6,
+        cmd_allocators: [max_frames_in_flight]*d3d12.ICommandAllocator,
+        cmd_list: *d3d12.IGraphicsCommandList6,
         rtv_pool: DescriptorPool,
         swapchain_buffers: [swapchain_buffer_count]SwapchainBuffer,
         current_frame_slot: u32,
@@ -781,22 +781,22 @@ pub const Fw = struct {
 
         d.frame_fence_counter = 0;
 
-        var cmdallocators: [max_frames_in_flight]*d3d12.ICommandAllocator = undefined;
-        for (cmdallocators) |_, index| {
+        var cmd_allocators: [max_frames_in_flight]*d3d12.ICommandAllocator = undefined;
+        for (cmd_allocators) |_, index| {
             try zwin32.hrErrorOnFail(device.CreateCommandAllocator(.DIRECT,
                                                                    &d3d12.IID_ICommandAllocator,
-                                                                   @ptrCast(*?*anyopaque, &cmdallocators[index])));
+                                                                   @ptrCast(*?*anyopaque, &cmd_allocators[index])));
         }
-        errdefer for (cmdallocators) |cmdallocator| { _ = cmdallocator.Release(); };
-        d.cmdallocators = cmdallocators;
+        errdefer for (cmd_allocators) |cmd_allocator| { _ = cmd_allocator.Release(); };
+        d.cmd_allocators = cmd_allocators;
 
-        var cmdlist: *d3d12.IGraphicsCommandList6 = undefined;
-        try zwin32.hrErrorOnFail(device.CreateCommandList(0, .DIRECT, cmdallocators[0], null, 
+        var cmd_list: *d3d12.IGraphicsCommandList6 = undefined;
+        try zwin32.hrErrorOnFail(device.CreateCommandList(0, .DIRECT, cmd_allocators[0], null,
                                                           &d3d12.IID_IGraphicsCommandList6,
-                                                          @ptrCast(*?*anyopaque, &cmdlist)));
-        errdefer _ = cmdlist.Release();
-        d.cmdlist = cmdlist;
-        try zwin32.hrErrorOnFail(cmdlist.Close());
+                                                          @ptrCast(*?*anyopaque, &cmd_list)));
+        errdefer _ = cmd_list.Release();
+        d.cmd_list = cmd_list;
+        try zwin32.hrErrorOnFail(cmd_list.Close());
 
         d.rtv_pool = try DescriptorPool.init(allocator, device, .RTV, d3d12.DESCRIPTOR_HEAP_FLAG_NONE);
         errdefer d.rtv_pool.deinit();
@@ -844,9 +844,9 @@ pub const Fw = struct {
         self.d.pipeline_pool.deinit();
         self.d.resource_pool.deinit();
         self.d.rtv_pool.deinit();
-        _ = self.d.cmdlist.Release();
-        for (self.d.cmdallocators) |cmdallocator| {
-            _ = cmdallocator.Release();
+        _ = self.d.cmd_list.Release();
+        for (self.d.cmd_allocators) |cmd_allocator| {
+            _ = cmd_allocator.Release();
         }
         w32.CloseHandle(self.d.frame_fence_event);
         _ = self.d.frame_fence.Release();
@@ -950,7 +950,7 @@ pub const Fw = struct {
             count += 1;
         }
         if (count > 0) {
-            self.d.cmdlist.ResourceBarrier(count, &barriers);
+            self.d.cmd_list.ResourceBarrier(count, &barriers);
         }
         self.d.trb_next = 0;
     }
@@ -960,7 +960,7 @@ pub const Fw = struct {
     }
 
     pub fn getCommandList(self: *const Fw) *d3d12.IGraphicsCommandList6 {
-        return self.d.cmdlist;
+        return self.d.cmd_list;
     }
 
     pub fn getResourcePool(self: *const Fw) *ObjectPool(Resource) {
@@ -1019,9 +1019,9 @@ pub const Fw = struct {
             self.d.current_frame_slot = 0;
         }
 
-        const ca = self.d.cmdallocators[self.d.current_frame_slot];
-        try zwin32.hrErrorOnFail(ca.Reset());
-        try zwin32.hrErrorOnFail(self.d.cmdlist.Reset(ca, null));
+        const cmd_allocator = self.d.cmd_allocators[self.d.current_frame_slot];
+        try zwin32.hrErrorOnFail(cmd_allocator.Reset());
+        try zwin32.hrErrorOnFail(self.d.cmd_list.Reset(cmd_allocator, null));
 
         self.addTransitionBarrier(self.getBackBufferObjectHandle(), d3d12.RESOURCE_STATE_RENDER_TARGET);
         self.recordTransitionBarriers();
@@ -1035,10 +1035,10 @@ pub const Fw = struct {
         self.addTransitionBarrier(self.getBackBufferObjectHandle(), d3d12.RESOURCE_STATE_PRESENT);
         self.recordTransitionBarriers();
 
-        try zwin32.hrErrorOnFail(self.d.cmdlist.Close());
+        try zwin32.hrErrorOnFail(self.d.cmd_list.Close());
 
         const list = [_]*d3d12.ICommandList {
-            @ptrCast(*d3d12.ICommandList, self.d.cmdlist)
+            @ptrCast(*d3d12.ICommandList, self.d.cmd_list)
         };
         self.d.cmdqueue.ExecuteCommandLists(1, &list);
 
@@ -1058,10 +1058,10 @@ pub const Fw = struct {
                 and pipeline_handle.generation == self.d.current_pipeline_handle.generation) {
             return;
         }
-        self.d.cmdlist.SetPipelineState(pipeline.pso);
+        self.d.cmd_list.SetPipelineState(pipeline.pso);
         switch (pipeline.ptype) {
-            .Graphics => self.d.cmdlist.SetGraphicsRootSignature(pipeline.rs),
-            .Compute => self.d.cmdlist.SetComputeRootSignature(pipeline.rs)
+            .Graphics => self.d.cmd_list.SetGraphicsRootSignature(pipeline.rs),
+            .Compute => self.d.cmd_list.SetComputeRootSignature(pipeline.rs)
         }
         self.d.current_pipeline_handle = pipeline_handle;
     }

@@ -454,10 +454,14 @@ pub const StagingArea = struct {
     pub const Allocation = struct {
         cpu_slice: []u8,
         gpu_addr: d3d12.GPU_VIRTUAL_ADDRESS,
-        buffer_offset: u32
+        buffer: *d3d12.IResource,
+        buffer_offset: u32,
+
+        pub fn castCpuSlice(self: *const Allocation, comptime T: type) []T {
+            return std.mem.bytesAsSlice(T, @alignCast(@alignOf(T), self.cpu_slice));
+        }
     };
 
-    buffer: *d3d12.IResource,
     mem: Allocation,
     size: u32,
     capacity: u32,
@@ -491,10 +495,10 @@ pub const StagingArea = struct {
         var p: [*]u8 = undefined;
         try zwin32.hrErrorOnFail(resource.Map(0,  &.{ .Begin = 0, .End = 0 }, @ptrCast(*?*anyopaque, &p)));
         return StagingArea {
-            .buffer = resource,
             .mem = .{
                 .cpu_slice = p[0..capacity],
                 .gpu_addr = resource.GetGPUVirtualAddress(),
+                .buffer = resource,
                 .buffer_offset = 0
             },
             .size = 0,
@@ -503,7 +507,7 @@ pub const StagingArea = struct {
     }
 
     pub fn deinit(self: *StagingArea) void {
-        _ = self.buffer.Release();
+        _ = self.mem.buffer.Release();
     }
 
     pub fn allocate(self: *StagingArea, size: u32) ?Allocation {
@@ -518,16 +522,13 @@ pub const StagingArea = struct {
         return .{
             .cpu_slice = cpu_slice,
             .gpu_addr = gpu_addr,
+            .buffer = self.mem.buffer,
             .buffer_offset = offset
         };
     }
 
     pub fn reset(self: *StagingArea) void {
         self.size = 0;
-    }
-
-    pub fn getBuffer(self: *const StagingArea) *d3d12.IResource {
-        return self.buffer;
     }
 };
 
@@ -914,7 +915,7 @@ pub const Fw = struct {
         var res = self.d.resource_pool.lookupRef(resource_handle) orelse return;
         if (state_after != res.state) {
             if (self.d.trb_next == self.d.transition_resource_barriers.len)
-                self.flushTransitionBarriers();
+                self.recordTransitionBarriers();
 
             self.d.transition_resource_barriers[self.d.trb_next] = TransitionResourceBarrier {
                 .resource_handle = resource_handle,
@@ -926,10 +927,12 @@ pub const Fw = struct {
         }
     }
 
-    pub fn flushTransitionBarriers(self: *Fw) void {
+    pub fn recordTransitionBarriers(self: *Fw) void {
         var barriers: [transition_resource_barrier_pool_size]d3d12.RESOURCE_BARRIER = undefined;
         var count: u32 = 0;
-        for (self.d.transition_resource_barriers) |*trb| {
+        var i: u32 = 0;
+        while (i < self.d.trb_next) : (i += 1) {
+            const trb = self.d.transition_resource_barriers[i];
             if (!self.d.resource_pool.isValid(trb.resource_handle))
                 continue;
             barriers[count] = .{
@@ -988,6 +991,13 @@ pub const Fw = struct {
         return self.d.swapchain_buffers[self.d.current_back_buffer_index].handle;
     }
 
+    pub fn getBackBufferPixelSize(self: *const Fw) struct { width: u32, height: u32 } {
+        return .{
+            .width = self.d.swapchain_width,
+            .height = self.d.swapchain_height
+        };
+    }
+
     pub fn beginFrame(self: *Fw) !void {
         self.waitGpuIfAhead();
 
@@ -1014,7 +1024,7 @@ pub const Fw = struct {
         try zwin32.hrErrorOnFail(self.d.cmdlist.Reset(ca, null));
 
         self.addTransitionBarrier(self.getBackBufferObjectHandle(), d3d12.RESOURCE_STATE_RENDER_TARGET);
-        self.flushTransitionBarriers();
+        self.recordTransitionBarriers();
 
         self.resetTrackedState();
 
@@ -1023,7 +1033,7 @@ pub const Fw = struct {
 
     pub fn endFrame(self: *Fw) !void {
         self.addTransitionBarrier(self.getBackBufferObjectHandle(), d3d12.RESOURCE_STATE_PRESENT);
-        self.flushTransitionBarriers();
+        self.recordTransitionBarriers();
 
         try zwin32.hrErrorOnFail(self.d.cmdlist.Close());
 
@@ -1146,7 +1156,7 @@ pub const Fw = struct {
         var dd: ?*Data = null;
         if (imgui.igGetCurrentContext() != null) {
             var io = imgui.igGetIO().?;
-            dd = @ptrCast(*Data, @alignCast(8, io.*.BackendPlatformUserData));
+            dd = @ptrCast(*Data, @alignCast(@alignOf(*Data), io.*.BackendPlatformUserData));
         }
         switch (message) {
             w32.user32.WM_DESTROY => {

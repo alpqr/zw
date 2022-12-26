@@ -5,7 +5,7 @@ const dxgi = zwin32.dxgi;
 const d3d = zwin32.d3d;
 const d3d12 = zwin32.d3d12;
 const d3d12d = zwin32.d3d12d;
-
+const zstbi = @import("zstbi");
 const imgui = @cImport({
     @cDefine("CIMGUI_DEFINE_ENUMS_AND_STRUCTS", "");
     @cDefine("CIMGUI_NO_EXPORT", "");
@@ -559,7 +559,7 @@ pub const StagingArea = struct {
         self.size = 0;
     }
 
-    pub fn freeCapacity(self: *const StagingArea) u32 {
+    pub fn remainingCapacity(self: *const StagingArea) u32 {
         return self.capacity - self.size;
     }
 };
@@ -657,6 +657,9 @@ pub const Fw = struct {
         var d = allocator.create(Data) catch unreachable;
         errdefer allocator.destroy(d);
         d.options = options;
+
+        zstbi.init(allocator);
+        errdefer zstbi.deinit();
 
         _ = imgui.igCreateContext(null);
         errdefer imgui.igDestroyContext(null);
@@ -896,8 +899,10 @@ pub const Fw = struct {
         var self = Fw {
             .d = d
         };
+
         try self.acquireSwapchainBuffers();
         try self.ensureDepthStencil();
+
         return self;
     }
 
@@ -930,6 +935,7 @@ pub const Fw = struct {
         _ = self.d.device.Release();
         _ = self.d.dxgiFactory.Release();
         imgui.igDestroyContext(null);
+        zstbi.deinit();
         allocator.destroy(self.d);
         w32.ole32.CoUninitialize();
     }
@@ -1288,6 +1294,33 @@ pub const Fw = struct {
             @ptrCast(*?*anyopaque, &resource)));
         errdefer _ = resource.Release();
         return try Resource.addToPool(&self.d.resource_pool, resource, d3d12.RESOURCE_STATE_DEPTH_WRITE);
+    }
+
+    pub fn createTexture2D(self: *Fw, format: dxgi.FORMAT, pixel_size: Size, mip_levels: u16) !ObjectHandle {
+        var heap_properties = std.mem.zeroes(d3d12.HEAP_PROPERTIES);
+        heap_properties.Type = .DEFAULT;
+        var resource: *d3d12.IResource = undefined;
+        try zwin32.hrErrorOnFail(self.d.device.CreateCommittedResource(
+            &heap_properties,
+            d3d12.HEAP_FLAG_NONE,
+            &.{
+                .Dimension = .TEXTURE2D,
+                .Alignment = 0,
+                .Width = pixel_size.width,
+                .Height = pixel_size.height,
+                .DepthOrArraySize = 1,
+                .MipLevels = mip_levels,
+                .Format = format,
+                .SampleDesc = .{ .Count = 1, .Quality = 0 },
+                .Layout = .UNKNOWN,
+                .Flags = d3d12.RESOURCE_FLAG_NONE
+            },
+            d3d12.RESOURCE_STATE_COPY_DEST,
+            null,
+            &d3d12.IID_IResource,
+            @ptrCast(*?*anyopaque, &resource)));
+        errdefer _ = resource.Release();
+        return try Resource.addToPool(&self.d.resource_pool, resource, d3d12.RESOURCE_STATE_COPY_DEST);
     }
 
     const PAINTSTRUCT = extern struct {

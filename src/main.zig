@@ -4,6 +4,7 @@ const w32 = zwin32.base;
 const d3d = zwin32.d3d;
 const d3d12 = zwin32.d3d12;
 const zm = @import("zmath");
+const zstbi = @import("zstbi");
 const zr = @import("zr.zig");
 
 const color_vs = @embedFile("shaders/color.vs.cso");
@@ -143,6 +144,7 @@ pub fn main() !void {
     var cbv_srv_uav_cpu_descriptor_pool = try zr.CpuDescriptorPool.init(allocator,
                                                                         device,
                                                                         .CBV_SRV_UAV);
+    defer cbv_srv_uav_cpu_descriptor_pool.deinit();
 
     const pipeline_handle = try create_pipeline(&fw);
     var vbuf = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(Vertex));
@@ -162,6 +164,27 @@ pub fn main() !void {
             .SizeInBytes = cbuf_size
         },
         cbv_cpu_descriptor.cpu_handle);
+
+    var test_image = try zstbi.Image.init("src/maps/test.png", 4);
+    defer test_image.deinit();
+    const test_texture = try fw.createTexture2D(.R8G8B8A8_UNORM, .{ .width = test_image.width, .height = test_image.height }, 1);
+    var test_srv = try cbv_srv_uav_cpu_descriptor_pool.allocate(1);
+    device.CreateShaderResourceView(
+        resource_pool.lookupRef(test_texture).?.resource,
+        &.{
+            .Format = .R8G8B8A8_UNORM,
+            .ViewDimension = .TEXTURE2D,
+            .Shader4ComponentMapping = d3d12.DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            .u = .{
+                .Texture2D = .{
+                    .MostDetailedMip = 0,
+                    .MipLevels = 1,
+                    .PlaneSlice = 0,
+                    .ResourceMinLODClamp = 0.0
+                }
+            }
+        },
+        test_srv.cpu_handle);
 
     while (zr.Fw.handleWindowEvents()) {
         if (try fw.beginFrame() != zr.Fw.BeginFrameResult.success) {
@@ -274,6 +297,4 @@ pub fn main() !void {
     }
 
     std.debug.print("Exiting\n", .{});
-
-    cbv_srv_uav_cpu_descriptor_pool.deinit();
 }

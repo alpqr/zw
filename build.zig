@@ -1,6 +1,7 @@
 const std = @import("std");
 const zwin32 = @import("libs/zwin32/build.zig");
 const zmath = @import("libs/zmath/build.zig");
+const zstbi = @import("libs/zstbi/build.zig");
 
 pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
@@ -10,6 +11,7 @@ pub fn build(b: *std.build.Builder) void {
 
     exe.addPackage(zwin32.pkg);
     exe.addPackage(zmath.pkg);
+    exe.addPackage(zstbi.pkg);
 
     const dxc_step = buildShaders(b);
     exe.step.dependOn(dxc_step);
@@ -26,6 +28,8 @@ pub fn build(b: *std.build.Builder) void {
 
     exe.linkSystemLibraryName("c");
     exe.linkSystemLibraryName("c++");
+
+    zstbi.link(exe);
 
     exe.setTarget(target);
     exe.setBuildMode(mode);

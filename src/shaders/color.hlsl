@@ -8,7 +8,7 @@ void vsMain(float3 position : POSITION,
             out float4 out_position : SV_Position,
             out float3 out_color : TEXCOORD0)
 {
-    out_position = mul(mvp, float4(position, 1.0));
+    out_position = mul(float4(position, 1.0), mvp);
     out_color = color;
 }
 

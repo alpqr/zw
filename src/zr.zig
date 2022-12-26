@@ -557,10 +557,25 @@ pub const StagingArea = struct {
     }
 };
 
+pub const Size = struct {
+    width: u32,
+    height: u32,
+
+    pub fn empty() Size {
+        return .{
+            .width = 0,
+            .height = 0
+        };
+    }
+
+    pub fn isEmpty(self: *const Size) bool {
+        return self.width == 0 or self.height == 0;
+    }
+};
+
 pub const Fw = struct {
     pub const Options = struct {
-        window_width: u32 = 1280,
-        window_height: u32 = 720,
+        window_size: Size = .{ .width = 1280, .height = 720 },
         window_name: [*:0]const u8 = "zigapp",
         enable_debug_layer: bool = false,
         swap_interval: u32 = 1,
@@ -587,15 +602,13 @@ pub const Fw = struct {
         options: Options,
         instance: w32.HINSTANCE,
         window: w32.HWND,
-        window_width: u32,
-        window_height: u32,
+        window_size: Size,
         dxgiFactory: *dxgi.IFactory6,
         device: *d3d12.IDevice9,
         cmdqueue: *d3d12.ICommandQueue,
         swapchain: *dxgi.ISwapChain3,
         swapchain_flags: u32,
-        swapchain_width: u32,
-        swapchain_height: u32,
+        swapchain_size: Size,
         frame_fence: *d3d12.IFence,
         frame_fence_event: w32.HANDLE,
         frame_fence_counter: u64,
@@ -662,15 +675,14 @@ pub const Fw = struct {
         _ = try w32.user32.registerClassExA(&winclass);
 
         // will be first updated on WM_SIZE
-        d.window_width = 0;
-        d.window_height = 0;
+        d.window_size = Size.empty();
 
         const style = w32.user32.WS_OVERLAPPEDWINDOW; // resizable, minimize, maximize
         var rect = w32.RECT {
             .left = 0,
             .top = 0,
-            .right = @intCast(i32, options.window_width),
-            .bottom = @intCast(i32, options.window_height)
+            .right = @intCast(i32, options.window_size.width),
+            .bottom = @intCast(i32, options.window_size.height)
         };
         try w32.user32.adjustWindowRectEx(&rect, style, false, 0);
 
@@ -758,16 +770,15 @@ pub const Fw = struct {
         errdefer _ = cmdqueue.Release();
         d.cmdqueue = cmdqueue;
 
-        d.swapchain_width = d.window_width;
-        d.swapchain_height = d.window_height;
+        d.swapchain_size = d.window_size;
 
         var swapchain: *dxgi.ISwapChain1 = undefined;
         d.swapchain_flags = 0;
         if (options.swap_interval == 0 and d.present_allow_tearing_supported)
             d.swapchain_flags |= dxgi.SWAP_CHAIN_FLAG_ALLOW_TEARING;
         const swapchainDesc = &dxgi.SWAP_CHAIN_DESC1 {
-            .Width = std.math.max(1, d.window_width),
-            .Height = std.math.max(1, d.window_height),
+            .Width = std.math.max(1, d.swapchain_size.width),
+            .Height = std.math.max(1, d.swapchain_size.height),
             .Format = .R8G8B8A8_UNORM,
             .Stereo = w32.FALSE,
             .SampleDesc = .{ .Count = 1, .Quality = 0 },
@@ -1044,28 +1055,33 @@ pub const Fw = struct {
         return self.d.swapchain_buffers[self.d.current_back_buffer_index].handle;
     }
 
-    pub fn getBackBufferPixelSize(self: *const Fw) struct { width: u32, height: u32 } {
-        return .{
-            .width = self.d.swapchain_width,
-            .height = self.d.swapchain_height
-        };
+    pub fn getBackBufferPixelSize(self: *const Fw) Size {
+        return self.d.swapchain_size;
     }
 
-    pub fn beginFrame(self: *Fw) !void {
+    pub const BeginFrameResult = enum {
+        success,
+        empty_output_size
+    };
+
+    pub fn beginFrame(self: *Fw) !BeginFrameResult {
         self.waitGpuIfAhead();
 
-        if (self.d.swapchain_width != self.d.window_width or self.d.swapchain_height != self.d.window_height) {
-            self.d.swapchain_width = self.d.window_width;
-            self.d.swapchain_height = self.d.window_height;
-            std.debug.print("Resizing swapchain {}x{}\n", .{self.d.swapchain_width, self.d.swapchain_height});
+        if (self.d.window_size.isEmpty()) { // e.g. when minimized
+            return BeginFrameResult.empty_output_size;
+        }
+
+        if (!std.meta.eql(self.d.swapchain_size, self.d.window_size)) {
+            self.d.swapchain_size = self.d.window_size;
+            std.debug.print("Resizing swapchain {}x{}\n", .{self.d.swapchain_size.width, self.d.swapchain_size.height});
             self.waitGpu();
             for (self.d.swapchain_buffers) |*swapchain_buffer| {
                 self.d.resource_pool.remove(swapchain_buffer.handle);
                 self.d.rtv_pool.release(swapchain_buffer.descriptor, 1);
             }
             try zwin32.hrErrorOnFail(self.d.swapchain.ResizeBuffers(swapchain_buffer_count,
-                                                                    std.math.max(1, self.d.window_width),
-                                                                    std.math.max(1, self.d.window_height),
+                                                                    self.d.swapchain_size.width,
+                                                                    self.d.swapchain_size.height,
                                                                     .R8G8B8A8_UNORM,
                                                                     self.d.swapchain_flags));
             try self.acquireSwapchainBuffers();
@@ -1083,6 +1099,8 @@ pub const Fw = struct {
 
         self.d.small_staging_areas[self.d.current_frame_slot].reset();
         self.d.shader_visible_descriptor_heap_ranges[self.d.current_frame_slot].reset();
+
+        return BeginFrameResult.success;
     }
 
     pub fn endFrame(self: *Fw) !void {
@@ -1226,12 +1244,13 @@ pub const Fw = struct {
             },
             w32.user32.WM_SIZE => {
                 if (dd) |d| {
-                    const newWidth = @intCast(u32, lparam & 0xFFFF);
-                    const newHeight = @intCast(u32, lparam >> 16);
-                    if (d.window_width != newWidth or d.window_height != newHeight) {
-                        d.window_width = newWidth;
-                        d.window_height = newHeight;
-                        std.debug.print("new width {} height {}\n", .{d.window_width, d.window_height});
+                    const new_size = Size {
+                        .width = @intCast(u32, lparam & 0xFFFF),
+                        .height = @intCast(u32, lparam >> 16)
+                    };
+                    if (!std.meta.eql(d.window_size, new_size)) {
+                        d.window_size = new_size;
+                        std.debug.print("new width {} height {}\n", .{d.window_size.width, d.window_size.height});
                     }
                 }
             },

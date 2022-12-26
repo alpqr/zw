@@ -145,6 +145,8 @@ pub fn main() !void {
     var ibuf = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(u16));
     var needs_upload = true;
     var rotation: f32 = 0.0;
+    var last_size_used_for_projection = zr.Size.empty();
+    var projection = zm.identity();
 
     const cbuf_size = zr.alignedSize(@sizeOf(CbData), 256);
     var cbuf = try fw.createBuffer(.UPLOAD, cbuf_size);
@@ -158,11 +160,21 @@ pub fn main() !void {
         cbv_cpu_descriptor.cpu_handle);
 
     while (zr.Fw.handleWindowEvents()) {
-        try fw.beginFrame();
+        if (try fw.beginFrame() != zr.Fw.BeginFrameResult.success) {
+            continue;
+        }
         const cmd_list = fw.getCommandList();
         const staging = fw.getCurrentSmallStagingArea();
         const shader_visible_cbv_srv_uav = fw.getCurrentShaderVisibleDescriptorHeapRange();
         const output_pixel_size = fw.getBackBufferPixelSize();
+
+        if (!std.meta.eql(output_pixel_size, last_size_used_for_projection)) {
+            last_size_used_for_projection = output_pixel_size;
+            projection = zm.perspectiveFovLh(45.0,
+                                             @intToFloat(f32, output_pixel_size.width) / @intToFloat(f32, output_pixel_size.height),
+                                             0.01,
+                                             1000.0);
+        }
 
         if (needs_upload) {
             needs_upload = false;
@@ -189,15 +201,20 @@ pub fn main() !void {
             fw.recordTransitionBarriers();
         }
 
-        // stored as row major, will need to transpose to get column major
-        const mvp = zm.rotationY(rotation);
-        rotation += 0.05;
-
         //var cbuf_area = staging.allocate(@sizeOf(CbData)).?;
         //zm.storeMat(cbuf_area.castCpuSlice(f32), zm.transpose(mvp));
+
         var cb_data: CbData = undefined;
+        const model = zm.rotationY(rotation);
+        const view = zm.translation(0.0, 0.0, 5.0);
+        const modelview = zm.mul(model, view);
+        const mvp = zm.mul(modelview, projection);
+
+        // Mat is stored as row major, transpose to get column major
         zm.storeMat(&cb_data.mvp, zm.transpose(mvp));
         std.mem.copy(u8, cbuf_p, std.mem.asBytes(&cb_data));
+
+        rotation += 0.05;
 
         const rt_cpu_handle = fw.getBackBufferCpuDescriptorHandle();
         cmd_list.OMSetRenderTargets(1, &[_]d3d12.CPU_DESCRIPTOR_HANDLE { rt_cpu_handle }, w32.TRUE, null);

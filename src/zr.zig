@@ -14,7 +14,14 @@ const imgui = @cImport({
 
 pub const Descriptor = struct {
     cpu_handle: d3d12.CPU_DESCRIPTOR_HANDLE,
-    gpu_handle: d3d12.GPU_DESCRIPTOR_HANDLE
+    gpu_handle: d3d12.GPU_DESCRIPTOR_HANDLE,
+
+    pub fn invalid() Descriptor {
+        return .{
+            .cpu_handle = std.mem.zeroes(d3d12.CPU_DESCRIPTOR_HANDLE),
+            .gpu_handle = std.mem.zeroes(d3d12.GPU_DESCRIPTOR_HANDLE)
+        };
+    }
 };
 
 pub const DescriptorHeap = struct {
@@ -586,6 +593,7 @@ pub const Fw = struct {
     pub const max_frames_in_flight = 2;
     const swapchain_buffer_count = 3;
     const transition_resource_barrier_buffer_size = 16;
+    pub const dsv_format = dxgi.FORMAT.D24_UNORM_S8_UINT;
 
     const SwapchainBuffer = struct {
         handle: ObjectHandle,
@@ -615,6 +623,7 @@ pub const Fw = struct {
         cmd_allocators: [max_frames_in_flight]*d3d12.ICommandAllocator,
         cmd_list: *d3d12.IGraphicsCommandList6,
         rtv_pool: CpuDescriptorPool,
+        dsv_pool: CpuDescriptorPool,
         swapchain_buffers: [swapchain_buffer_count]SwapchainBuffer,
         current_frame_slot: u32,
         current_back_buffer_index: u32,
@@ -627,6 +636,8 @@ pub const Fw = struct {
         small_staging_areas: [max_frames_in_flight]StagingArea,
         shader_visible_descriptor_heap: DescriptorHeap,
         shader_visible_descriptor_heap_ranges: [max_frames_in_flight]DescriptorHeap,
+        depth_stencil_buffer: ObjectHandle,
+        dsv: Descriptor,
         current_pipeline_handle: ObjectHandle,
     };
     d: *Data,
@@ -777,8 +788,8 @@ pub const Fw = struct {
         if (options.swap_interval == 0 and d.present_allow_tearing_supported)
             d.swapchain_flags |= dxgi.SWAP_CHAIN_FLAG_ALLOW_TEARING;
         const swapchainDesc = &dxgi.SWAP_CHAIN_DESC1 {
-            .Width = std.math.max(1, d.swapchain_size.width),
-            .Height = std.math.max(1, d.swapchain_size.height),
+            .Width = d.swapchain_size.width,
+            .Height = d.swapchain_size.height,
             .Format = .R8G8B8A8_UNORM,
             .Stereo = w32.FALSE,
             .SampleDesc = .{ .Count = 1, .Quality = 0 },
@@ -840,6 +851,9 @@ pub const Fw = struct {
         d.rtv_pool = try CpuDescriptorPool.init(allocator, device, .RTV);
         errdefer d.rtv_pool.deinit();
 
+        d.dsv_pool = try CpuDescriptorPool.init(allocator, device, .DSV);
+        errdefer d.dsv_pool.deinit();
+
         d.resource_pool = try ObjectPool(Resource).init(allocator);
         errdefer d.resource_pool.deinit();
 
@@ -874,12 +888,16 @@ pub const Fw = struct {
 
         d.current_frame_slot = 0;
 
+        d.depth_stencil_buffer = ObjectHandle.invalid();
+        d.dsv = Descriptor.invalid();
+
         d.current_pipeline_handle = ObjectHandle.invalid();
 
         var self = Fw {
             .d = d
         };
         try self.acquireSwapchainBuffers();
+        try self.ensureDepthStencil();
         return self;
     }
 
@@ -899,6 +917,7 @@ pub const Fw = struct {
         self.d.pipeline_cache.deinit();
         self.d.pipeline_pool.deinit();
         self.d.resource_pool.deinit();
+        self.d.dsv_pool.deinit();
         self.d.rtv_pool.deinit();
         _ = self.d.cmd_list.Release();
         for (self.d.cmd_allocators) |cmd_allocator| {
@@ -946,6 +965,23 @@ pub const Fw = struct {
         }
         self.d.swapchain_buffers = swapchain_buffers;
         self.d.current_back_buffer_index = self.d.swapchain.GetCurrentBackBufferIndex();
+    }
+
+    fn ensureDepthStencil(self: *Fw) !void {
+        if (self.d.resource_pool.lookupRef(self.d.depth_stencil_buffer)) |res| {
+            if (res.desc.Width == self.d.swapchain_size.width and res.desc.Height == self.d.swapchain_size.height) {
+                return;
+            }
+            self.d.resource_pool.remove(self.d.depth_stencil_buffer);
+            self.d.depth_stencil_buffer = ObjectHandle.invalid();
+            self.d.dsv_pool.release(self.d.dsv, 1);
+            self.d.dsv = Descriptor.invalid();
+        }
+        self.d.depth_stencil_buffer = try self.createDepthStencilBuffer(self.d.swapchain_size);
+        self.d.dsv = try self.d.dsv_pool.allocate(1);
+        self.d.device.CreateDepthStencilView(self.d.resource_pool.lookupRef(self.d.depth_stencil_buffer).?.resource,
+                                             null,
+                                             self.d.dsv.cpu_handle);
     }
 
     pub fn waitGpu(self: *Fw) void {
@@ -1047,6 +1083,10 @@ pub const Fw = struct {
         return &self.d.shader_visible_descriptor_heap_ranges[self.d.current_frame_slot];
     }
 
+    pub fn getDepthStencilBufferCpuDescriptorHandle(self: *const Fw) d3d12.CPU_DESCRIPTOR_HANDLE {
+        return self.d.dsv.cpu_handle;
+    }
+
     pub fn getBackBufferCpuDescriptorHandle(self: *const Fw) d3d12.CPU_DESCRIPTOR_HANDLE {
         return self.d.swapchain_buffers[self.d.current_back_buffer_index].descriptor.cpu_handle;
     }
@@ -1086,6 +1126,7 @@ pub const Fw = struct {
                                                                     self.d.swapchain_flags));
             try self.acquireSwapchainBuffers();
             self.d.current_frame_slot = 0;
+            try self.ensureDepthStencil();
         }
 
         const cmd_allocator = self.d.cmd_allocators[self.d.current_frame_slot];
@@ -1212,6 +1253,41 @@ pub const Fw = struct {
         try zwin32.hrErrorOnFail(res.resource.Map(0,  &.{ .Begin = 0, .End = 0 }, @ptrCast(*?*anyopaque, &p)));
         const slice = p[0..res.desc.Width];
         return std.mem.bytesAsSlice(T, @alignCast(@alignOf(T), slice));
+    }
+
+    fn createDepthStencilBuffer(self: *Fw, pixel_size: Size) !ObjectHandle {
+        var heap_properties = std.mem.zeroes(d3d12.HEAP_PROPERTIES);
+        heap_properties.Type = .DEFAULT;
+        var resource: *d3d12.IResource = undefined;
+        try zwin32.hrErrorOnFail(self.d.device.CreateCommittedResource(
+            &heap_properties,
+            d3d12.HEAP_FLAG_NONE,
+            &.{
+                .Dimension = .TEXTURE2D,
+                .Alignment = 0,
+                .Width = pixel_size.width,
+                .Height = pixel_size.height,
+                .DepthOrArraySize = 1,
+                .MipLevels = 1,
+                .Format = Fw.dsv_format,
+                .SampleDesc = .{ .Count = 1, .Quality = 0 },
+                .Layout = .UNKNOWN,
+                .Flags = d3d12.RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | d3d12.RESOURCE_FLAG_DENY_SHADER_RESOURCE
+            },
+            d3d12.RESOURCE_STATE_DEPTH_WRITE,
+            &.{
+                .Format = Fw.dsv_format,
+                .u = .{
+                    .DepthStencil = .{
+                        .Depth = 1.0,
+                        .Stencil = 0
+                    }
+                }
+            },
+            &d3d12.IID_IResource,
+            @ptrCast(*?*anyopaque, &resource)));
+        errdefer _ = resource.Release();
+        return try Resource.addToPool(&self.d.resource_pool, resource, d3d12.RESOURCE_STATE_DEPTH_WRITE);
     }
 
     const PAINTSTRUCT = extern struct {

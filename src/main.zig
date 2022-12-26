@@ -74,9 +74,13 @@ fn create_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     pso_desc.RasterizerState.FillMode = .SOLID;
     pso_desc.RasterizerState.CullMode = .NONE; // .BACK
     pso_desc.RasterizerState.FrontCounterClockwise = w32.TRUE;
+    pso_desc.DepthStencilState.DepthEnable = w32.TRUE;
+    pso_desc.DepthStencilState.DepthWriteMask = .ALL;
+    pso_desc.DepthStencilState.DepthFunc = .LESS;
     pso_desc.PrimitiveTopologyType = .TRIANGLE;
     pso_desc.NumRenderTargets = 1;
     pso_desc.RTVFormats[0] = .R8G8B8A8_UNORM;
+    pso_desc.DSVFormat = zr.Fw.dsv_format;
     pso_desc.SampleDesc = .{ .Count = 1, .Quality = 0 };
 
     const rs_desc = d3d12.VERSIONED_ROOT_SIGNATURE_DESC {
@@ -216,9 +220,11 @@ pub fn main() !void {
 
         rotation += 0.05;
 
-        const rt_cpu_handle = fw.getBackBufferCpuDescriptorHandle();
-        cmd_list.OMSetRenderTargets(1, &[_]d3d12.CPU_DESCRIPTOR_HANDLE { rt_cpu_handle }, w32.TRUE, null);
-        cmd_list.ClearRenderTargetView(rt_cpu_handle, &[4]f32 { 0.4, 0.7, 0.0, 1.0 }, 0, null);
+        const rtv = fw.getBackBufferCpuDescriptorHandle();
+        const dsv = fw.getDepthStencilBufferCpuDescriptorHandle();
+        cmd_list.OMSetRenderTargets(1, &[_]d3d12.CPU_DESCRIPTOR_HANDLE { rtv }, w32.TRUE, &dsv);
+        cmd_list.ClearRenderTargetView(rtv, &[4]f32 { 0.4, 0.7, 0.0, 1.0 }, 0, null);
+        cmd_list.ClearDepthStencilView(dsv, d3d12.CLEAR_FLAG_DEPTH | d3d12.CLEAR_FLAG_STENCIL, 1.0, 0, 0, null);
 
         cmd_list.RSSetViewports(1, &[_]d3d12.VIEWPORT {
             .{

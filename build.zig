@@ -1,5 +1,6 @@
 const std = @import("std");
 const zwin32 = @import("libs/zwin32/build.zig");
+const zmath = @import("libs/zmath/build.zig");
 
 pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
@@ -8,6 +9,7 @@ pub fn build(b: *std.build.Builder) void {
     const exe = b.addExecutable("zw", "src/main.zig");
 
     exe.addPackage(zwin32.pkg);
+    exe.addPackage(zmath.pkg);
 
     const dxc_step = buildShaders(b);
     exe.step.dependOn(dxc_step);

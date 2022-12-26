@@ -3,6 +3,7 @@ const zwin32 = @import("zwin32");
 const w32 = zwin32.base;
 const d3d = zwin32.d3d;
 const d3d12 = zwin32.d3d12;
+const zm = @import("zmath");
 const zr = @import("zr.zig");
 
 const color_vs = @embedFile("shaders/color.vs.cso");
@@ -28,6 +29,11 @@ const vertices = [_]Vertex {
         .color = [3]f32 { 0.0, 0.0, 1.0 }
     }
 };
+
+const CbData = struct {
+    mvp: [16]f32
+};
+comptime { std.debug.assert(@sizeOf(CbData) == 64); }
 
 fn create_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     const input_element_descs = [_]d3d12.INPUT_ELEMENT_DESC {
@@ -66,7 +72,7 @@ fn create_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
     pso_desc.SampleMask = 0xFFFFFFFF;
     pso_desc.RasterizerState.FillMode = .SOLID;
-    pso_desc.RasterizerState.CullMode = .BACK;
+    pso_desc.RasterizerState.CullMode = .NONE; // .BACK
     pso_desc.RasterizerState.FrontCounterClockwise = w32.TRUE;
     pso_desc.PrimitiveTopologyType = .TRIANGLE;
     pso_desc.NumRenderTargets = 1;
@@ -74,24 +80,39 @@ fn create_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     pso_desc.SampleDesc = .{ .Count = 1, .Quality = 0 };
 
     const rs_desc = d3d12.VERSIONED_ROOT_SIGNATURE_DESC {
-        .Version = d3d12.ROOT_SIGNATURE_VERSION.VERSION_1_0,
+        .Version = d3d12.ROOT_SIGNATURE_VERSION.VERSION_1_1,
         .u = .{
-            .Desc_1_0 = .{
-                .NumParameters = 0,
-                .pParameters = null,
-                // .NumParameters = 1,
-                // .pParameters = &[_]d3d12.ROOT_PARAMETER {
-                //     .{
-                //         .ParameterType = .CBV,
-                //         .u = .{
-                //             .Descriptor = .{
-                //                 .ShaderRegister = 0,
-                //                 .RegisterSpace = 0
-                //             }
-                //         },
-                //         .ShaderVisibility = .ALL
-                //     }
-                // },
+            .Desc_1_1 = .{
+                .NumParameters = 1,
+                .pParameters = &[_]d3d12.ROOT_PARAMETER1 {
+                    .{
+                        // .ParameterType = .CBV,
+                        // .u = .{
+                        //     .Descriptor = .{
+                        //         .ShaderRegister = 0,
+                        //         .RegisterSpace = 0,
+                        //         .Flags = d3d12.ROOT_DESCRIPTOR_FLAG_NONE
+                        //     }
+                        // },
+                        .ParameterType = .DESCRIPTOR_TABLE,
+                        .u = .{
+                            .DescriptorTable = .{
+                                .NumDescriptorRanges = 1,
+                                .pDescriptorRanges = &[_]d3d12.DESCRIPTOR_RANGE1 {
+                                    .{
+                                        .RangeType = .CBV,
+                                        .NumDescriptors = 1,
+                                        .BaseShaderRegister = 0,
+                                        .RegisterSpace = 0,
+                                        .Flags = d3d12.DESCRIPTOR_RANGE_FLAG_NONE,
+                                        .OffsetInDescriptorsFromTableStart = 0
+                                    }
+                                }
+                            }
+                        },
+                        .ShaderVisibility = .ALL
+                    }
+                },
                 .NumStaticSamplers = 0,
                 .pStaticSamplers = null,
                 .Flags = d3d12.ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
@@ -112,16 +133,35 @@ pub fn main() !void {
     });
     defer fw.deinit(allocator);
 
+    const device = fw.getDevice();
+    const resource_pool = fw.getResourcePool();
+
+    var cbv_srv_uav_cpu_descriptor_pool = try zr.CpuDescriptorPool.init(allocator,
+                                                                        device,
+                                                                        .CBV_SRV_UAV);
+
     const pipeline_handle = try create_pipeline(&fw);
     var vbuf = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(Vertex));
     var ibuf = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(u16));
     var needs_upload = true;
+    var rotation: f32 = 0.0;
+
+    const cbuf_size = zr.alignedSize(@sizeOf(CbData), 256);
+    var cbuf = try fw.createBuffer(.UPLOAD, cbuf_size);
+    var cbuf_p = try fw.mapBuffer(u8, cbuf);
+    var cbv_cpu_descriptor = try cbv_srv_uav_cpu_descriptor_pool.allocate(1);
+    device.CreateConstantBufferView(
+        &.{
+            .BufferLocation = resource_pool.lookupRef(cbuf).?.resource.GetGPUVirtualAddress(),
+            .SizeInBytes = cbuf_size
+        },
+        cbv_cpu_descriptor.cpu_handle);
 
     while (zr.Fw.handleWindowEvents()) {
         try fw.beginFrame();
         const cmd_list = fw.getCommandList();
-        const resource_pool = fw.getResourcePool();
-        const staging = fw.getCurrentSmallUploadStagingArea();
+        const staging = fw.getCurrentSmallStagingArea();
+        const shader_visible_cbv_srv_uav = fw.getCurrentShaderVisibleDescriptorHeapRange();
         const output_pixel_size = fw.getBackBufferPixelSize();
 
         if (needs_upload) {
@@ -149,6 +189,16 @@ pub fn main() !void {
             fw.recordTransitionBarriers();
         }
 
+        // stored as row major, will need to transpose to get column major
+        const mvp = zm.rotationY(rotation);
+        rotation += 0.05;
+
+        //var cbuf_area = staging.allocate(@sizeOf(CbData)).?;
+        //zm.storeMat(cbuf_area.castCpuSlice(f32), zm.transpose(mvp));
+        var cb_data: CbData = undefined;
+        zm.storeMat(&cb_data.mvp, zm.transpose(mvp));
+        std.mem.copy(u8, cbuf_p, std.mem.asBytes(&cb_data));
+
         const rt_cpu_handle = fw.getBackBufferCpuDescriptorHandle();
         cmd_list.OMSetRenderTargets(1, &[_]d3d12.CPU_DESCRIPTOR_HANDLE { rt_cpu_handle }, w32.TRUE, null);
         cmd_list.ClearRenderTargetView(rt_cpu_handle, &[4]f32 { 0.4, 0.7, 0.0, 1.0 }, 0, null);
@@ -173,6 +223,7 @@ pub fn main() !void {
         });
 
         fw.setPipeline(pipeline_handle);
+
         cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
         cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
             .{
@@ -186,10 +237,20 @@ pub fn main() !void {
             .SizeInBytes = 3 * @sizeOf(u16),
             .Format = .R16_UINT,
         });
+
+        //cmd_list.SetGraphicsRootConstantBufferView(0, cbuf_area.gpu_addr);
+        cmd_list.SetDescriptorHeaps(1, &[_]*d3d12.IDescriptorHeap {
+            fw.getShaderVisibleDescriptorHeap()
+        });
+        device.CopyDescriptorsSimple(1, shader_visible_cbv_srv_uav.get(1).cpu_handle, cbv_cpu_descriptor.cpu_handle, .CBV_SRV_UAV);
+        cmd_list.SetGraphicsRootDescriptorTable(0, shader_visible_cbv_srv_uav.at(0).gpu_handle);
+
         cmd_list.DrawIndexedInstanced(3, 1, 0, 0, 0);
 
         try fw.endFrame();
     }
 
     std.debug.print("Exiting\n", .{});
+
+    cbv_srv_uav_cpu_descriptor_pool.deinit();
 }

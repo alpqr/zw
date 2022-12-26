@@ -18,7 +18,7 @@ pub const Descriptor = struct {
 };
 
 pub const DescriptorHeap = struct {
-    heap: *d3d12.IDescriptorHeap,
+    heap: ?*d3d12.IDescriptorHeap,
     base: Descriptor,
     size: u32,
     capacity: u32,
@@ -44,8 +44,9 @@ pub const DescriptorHeap = struct {
         const descriptor_byte_size = device.GetDescriptorHandleIncrementSize(heap_type);
         const cpu_handle = heap.GetCPUDescriptorHandleForHeapStart();
         var gpu_handle = d3d12.GPU_DESCRIPTOR_HANDLE { .ptr = 0 };
-        if ((heap_flags & d3d12.DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0)
+        if ((heap_flags & d3d12.DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
             gpu_handle = heap.GetGPUDescriptorHandleForHeapStart();
+        }
 
         return DescriptorHeap {
             .heap = heap,
@@ -61,8 +62,27 @@ pub const DescriptorHeap = struct {
         };
     }
 
+    pub fn initWithExisting(other: DescriptorHeap, offset_in_descriptors: u32, capacity: u32) DescriptorHeap {
+        var base = other.base;
+        base.cpu_handle.ptr += offset_in_descriptors * other.descriptor_byte_size;
+        if (base.gpu_handle.ptr != 0) {
+            base.gpu_handle.ptr += offset_in_descriptors * other.descriptor_byte_size;
+        }
+        return DescriptorHeap {
+            .heap = null,
+            .base = base,
+            .size = 0,
+            .capacity = capacity,
+            .descriptor_byte_size = other.descriptor_byte_size,
+            .heap_type = other.heap_type,
+            .heap_flags = other.heap_flags
+        };
+    }
+
     pub fn deinit(self: *DescriptorHeap) void {
-        _ = self.heap.Release();
+        if (self.heap) |h| {
+            _ = h.Release();
+        }
     }
 
     pub fn get(self: *DescriptorHeap, count: u32) Descriptor {
@@ -79,10 +99,12 @@ pub const DescriptorHeap = struct {
     pub fn at(self: *const DescriptorHeap, index: u32) Descriptor {
         const start_offset = index * self.descriptor_byte_size;
 
-        const cpu_handle = d3d12.CPU_DESCRIPTOR_HANDLE { .ptr = self.base.cpu_handle.ptr + start_offset };
-        var gpu_handle = d3d12.GPU_DESCRIPTOR_HANDLE { .ptr = 0 };
-        if (self.base.gpu_handle.ptr != 0)
-            gpu_handle = d3d12.GPU_DESCRIPTOR_HANDLE { .ptr = self.base.gpu_handle.ptr + start_offset };
+        const cpu_handle = d3d12.CPU_DESCRIPTOR_HANDLE {
+            .ptr = self.base.cpu_handle.ptr + start_offset
+        };
+        var gpu_handle = d3d12.GPU_DESCRIPTOR_HANDLE {
+            .ptr = if (self.base.gpu_handle.ptr != 0) self.base.gpu_handle.ptr + start_offset else 0
+        };
 
         return Descriptor {
             .cpu_handle = cpu_handle,
@@ -95,7 +117,7 @@ pub const DescriptorHeap = struct {
     }
 };
 
-pub const DescriptorPool = struct {
+pub const CpuDescriptorPool = struct {
     const descriptors_per_heap = 256;
 
     const HeapWithMap = struct {
@@ -108,9 +130,8 @@ pub const DescriptorPool = struct {
 
     pub fn init(allocator: std.mem.Allocator,
                 device: *d3d12.IDevice9,
-                heap_type: d3d12.DESCRIPTOR_HEAP_TYPE,
-                heap_flags: d3d12.DESCRIPTOR_HEAP_FLAGS) !DescriptorPool {
-        var firstHeap = try DescriptorHeap.init(device, descriptors_per_heap, heap_type, heap_flags);
+                heap_type: d3d12.DESCRIPTOR_HEAP_TYPE) !CpuDescriptorPool {
+        var firstHeap = try DescriptorHeap.init(device, descriptors_per_heap, heap_type, d3d12.DESCRIPTOR_HEAP_FLAG_NONE);
         errdefer firstHeap.deinit();
         const h = HeapWithMap {
             .heap = firstHeap,
@@ -118,21 +139,21 @@ pub const DescriptorPool = struct {
         };
         var heaps = std.ArrayList(HeapWithMap).init(allocator);
         try heaps.append(h);
-        return DescriptorPool {
+        return CpuDescriptorPool {
             .heaps = heaps,
             .descriptor_byte_size = firstHeap.descriptor_byte_size,
             .device = device,
         };
     }
 
-    pub fn deinit(self: *DescriptorPool) void {
+    pub fn deinit(self: *CpuDescriptorPool) void {
         for (self.heaps.items) |*h| {
             h.heap.deinit();
         }
         self.heaps.deinit();
     }
 
-    pub fn allocate(self: *DescriptorPool, count: u32) !Descriptor {
+    pub fn allocate(self: *CpuDescriptorPool, count: u32) !Descriptor {
         std.debug.assert(count > 0 and count <= descriptors_per_heap);
         var last = &self.heaps.items[self.heaps.items.len - 1];
         if (last.heap.size + count <= last.heap.capacity) {
@@ -178,7 +199,7 @@ pub const DescriptorPool = struct {
         return last.heap.get(count);
     }
 
-    pub fn release(self: *DescriptorPool, descriptor: Descriptor, count: u32) void {
+    pub fn release(self: *CpuDescriptorPool, descriptor: Descriptor, count: u32) void {
         std.debug.assert(count > 0 and count <= descriptors_per_heap);
         const addr = descriptor.cpu_handle.ptr;
         for (self.heaps.items) |*h| {
@@ -530,6 +551,10 @@ pub const StagingArea = struct {
     pub fn reset(self: *StagingArea) void {
         self.size = 0;
     }
+
+    pub fn freeCapacity(self: *const StagingArea) u32 {
+        return self.capacity - self.size;
+    }
 };
 
 pub const Fw = struct {
@@ -539,12 +564,13 @@ pub const Fw = struct {
         window_name: [*:0]const u8 = "zigapp",
         enable_debug_layer: bool = false,
         swap_interval: u32 = 1,
-        small_upload_staging_area_capacity_per_frame: u32 = 16 * 1024 * 1024,
+        small_staging_area_capacity_per_frame: u32 = 16 * 1024 * 1024,
+        shader_visible_descriptor_heap_capacity_per_frame: u32 = 256,
     };
 
     pub const max_frames_in_flight = 2;
     const swapchain_buffer_count = 3;
-    const transition_resource_barrier_pool_size = 64;
+    const transition_resource_barrier_buffer_size = 16;
 
     const SwapchainBuffer = struct {
         handle: ObjectHandle,
@@ -575,7 +601,7 @@ pub const Fw = struct {
         frame_fence_counter: u64,
         cmd_allocators: [max_frames_in_flight]*d3d12.ICommandAllocator,
         cmd_list: *d3d12.IGraphicsCommandList6,
-        rtv_pool: DescriptorPool,
+        rtv_pool: CpuDescriptorPool,
         swapchain_buffers: [swapchain_buffer_count]SwapchainBuffer,
         current_frame_slot: u32,
         current_back_buffer_index: u32,
@@ -585,7 +611,9 @@ pub const Fw = struct {
         pipeline_cache: Pipeline.Cache,
         transition_resource_barriers: []TransitionResourceBarrier,
         trb_next: u32,
-        small_upload_staging_areas: [max_frames_in_flight]StagingArea,
+        small_staging_areas: [max_frames_in_flight]StagingArea,
+        shader_visible_descriptor_heap: DescriptorHeap,
+        shader_visible_descriptor_heap_ranges: [max_frames_in_flight]DescriptorHeap,
         current_pipeline_handle: ObjectHandle,
     };
     d: *Data,
@@ -798,7 +826,7 @@ pub const Fw = struct {
         d.cmd_list = cmd_list;
         try zwin32.hrErrorOnFail(cmd_list.Close());
 
-        d.rtv_pool = try DescriptorPool.init(allocator, device, .RTV, d3d12.DESCRIPTOR_HEAP_FLAG_NONE);
+        d.rtv_pool = try CpuDescriptorPool.init(allocator, device, .RTV);
         errdefer d.rtv_pool.deinit();
 
         d.resource_pool = try ObjectPool(Resource).init(allocator);
@@ -810,14 +838,27 @@ pub const Fw = struct {
         d.pipeline_cache = Pipeline.Cache.init(allocator);
         errdefer d.pipeline_cache.deinit();
 
-        d.transition_resource_barriers = try allocator.alloc(TransitionResourceBarrier, transition_resource_barrier_pool_size);
+        d.transition_resource_barriers = try allocator.alloc(TransitionResourceBarrier, transition_resource_barrier_buffer_size);
         errdefer allocator.free(d.transition_resource_barriers);
         d.trb_next = 0;
 
-        for (d.small_upload_staging_areas) |_, index| {
-            d.small_upload_staging_areas[index] = try StagingArea.init(d.device,
-                                                                       d.options.small_upload_staging_area_capacity_per_frame,
-                                                                       .UPLOAD);
+        for (d.small_staging_areas) |_, index| {
+            d.small_staging_areas[index] = try StagingArea.init(d.device,
+                                                                d.options.small_staging_area_capacity_per_frame,
+                                                                .UPLOAD);
+        }
+
+        const svdh_capacity = d.options.shader_visible_descriptor_heap_capacity_per_frame;
+        d.shader_visible_descriptor_heap = try DescriptorHeap.init(d.device,
+                                                                   max_frames_in_flight * svdh_capacity,
+                                                                   .CBV_SRV_UAV,
+                                                                   d3d12.DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+        errdefer d.shader_visible_descriptor_heap.deinit();
+        for (d.shader_visible_descriptor_heap_ranges) |_, index| {
+            d.shader_visible_descriptor_heap_ranges[index] = DescriptorHeap.initWithExisting(
+                d.shader_visible_descriptor_heap,
+                @intCast(u32, index * svdh_capacity),
+                svdh_capacity);
         }
 
         d.current_frame_slot = 0;
@@ -836,8 +877,12 @@ pub const Fw = struct {
         for (self.d.swapchain_buffers) |swapchain_buffer| {
             self.d.resource_pool.remove(swapchain_buffer.handle);
         }
-        for (self.d.small_upload_staging_areas) |*upload_staging_area| {
-            upload_staging_area.deinit();
+        self.d.shader_visible_descriptor_heap.deinit();
+        for (self.d.shader_visible_descriptor_heap_ranges) |*h| {
+            h.deinit();
+        }
+        for (self.d.small_staging_areas) |*staging_area| {
+            staging_area.deinit();
         }
         allocator.free(self.d.transition_resource_barriers);
         self.d.pipeline_cache.deinit();
@@ -928,7 +973,7 @@ pub const Fw = struct {
     }
 
     pub fn recordTransitionBarriers(self: *Fw) void {
-        var barriers: [transition_resource_barrier_pool_size]d3d12.RESOURCE_BARRIER = undefined;
+        var barriers: [transition_resource_barrier_buffer_size]d3d12.RESOURCE_BARRIER = undefined;
         var count: u32 = 0;
         var i: u32 = 0;
         while (i < self.d.trb_next) : (i += 1) {
@@ -979,8 +1024,16 @@ pub const Fw = struct {
         return self.d.current_frame_slot;
     }
 
-    pub fn getCurrentSmallUploadStagingArea(self: *const Fw) *StagingArea {
-        return &self.d.small_upload_staging_areas[self.d.current_frame_slot];
+    pub fn getCurrentSmallStagingArea(self: *const Fw) *StagingArea {
+        return &self.d.small_staging_areas[self.d.current_frame_slot];
+    }
+
+    pub fn getShaderVisibleDescriptorHeap(self: *const Fw) *d3d12.IDescriptorHeap {
+        return self.d.shader_visible_descriptor_heap.heap.?;
+    }
+
+    pub fn getCurrentShaderVisibleDescriptorHeapRange(self: *const Fw) *DescriptorHeap {
+        return &self.d.shader_visible_descriptor_heap_ranges[self.d.current_frame_slot];
     }
 
     pub fn getBackBufferCpuDescriptorHandle(self: *const Fw) d3d12.CPU_DESCRIPTOR_HANDLE {
@@ -1028,7 +1081,8 @@ pub const Fw = struct {
 
         self.resetTrackedState();
 
-        self.d.small_upload_staging_areas[self.d.current_frame_slot].reset();
+        self.d.small_staging_areas[self.d.current_frame_slot].reset();
+        self.d.shader_visible_descriptor_heap_ranges[self.d.current_frame_slot].reset();
     }
 
     pub fn endFrame(self: *Fw) !void {
@@ -1132,6 +1186,14 @@ pub const Fw = struct {
             @ptrCast(*?*anyopaque, &resource)));
         errdefer _ = resource.Release();
         return try Resource.addToPool(&self.d.resource_pool, resource, d3d12.RESOURCE_STATE_COMMON);
+    }
+
+    pub fn mapBuffer(self: *const Fw, comptime T: type, resource_handle: ObjectHandle) ![]T {
+        const res = self.d.resource_pool.lookupRef(resource_handle).?;
+        var p: [*]u8 = undefined;
+        try zwin32.hrErrorOnFail(res.resource.Map(0,  &.{ .Begin = 0, .End = 0 }, @ptrCast(*?*anyopaque, &p)));
+        const slice = p[0..res.desc.Width];
+        return std.mem.bytesAsSlice(T, @alignCast(@alignOf(T), slice));
     }
 
     const PAINTSTRUCT = extern struct {

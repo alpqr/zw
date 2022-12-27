@@ -1352,21 +1352,28 @@ pub const Fw = struct {
         return try Resource.addToPool(&self.d.resource_pool, resource, d3d12.RESOURCE_STATE_COMMON);
     }
 
-    pub fn uploadTexture2DSimple(self: *Fw, texture: ObjectHandle, image: zstbi.Image, staging: *StagingArea) void {
-        var tex = self.d.resource_pool.lookupRef(texture).?;
+    pub fn uploadTexture2DSimple(self: *Fw,
+                                 texture: ObjectHandle,
+                                 data: []u8,
+                                 data_bytes_per_line: u32,
+                                 staging: *StagingArea) void {
+        var tex_opt = self.d.resource_pool.lookupRef(texture);
+        if (tex_opt == null)
+            return;
+        var tex = tex_opt.?;
         var layout: [1]d3d12.PLACED_SUBRESOURCE_FOOTPRINT = undefined;
         var required_image_data_size: u64 = undefined;
         self.d.device.GetCopyableFootprints(&tex.desc, 0, 1, 0, &layout, null, null, &required_image_data_size);
         const required_bytes_per_line = layout[0].Footprint.RowPitch; // multiple of 256
-        std.debug.assert(image.bytes_per_row <= required_bytes_per_line);
+        std.debug.assert(data_bytes_per_line <= required_bytes_per_line);
         const alloc = staging.allocate(@intCast(u32, required_image_data_size)).?;
         var y: u32 = 0;
-        while (y < image.height) : (y += 1) {
-            const src_begin = y * image.bytes_per_row;
-            const src_end = src_begin + image.bytes_per_row;
+        while (y < tex.desc.Height) : (y += 1) {
+            const src_begin = y * data_bytes_per_line;
+            const src_end = src_begin + data_bytes_per_line;
             const dst_begin = y * required_bytes_per_line;
             const dst_end = dst_begin + required_bytes_per_line;
-            std.mem.copy(u8, alloc.cpu_slice[dst_begin..dst_end], image.data[src_begin..src_end]);
+            std.mem.copy(u8, alloc.cpu_slice[dst_begin..dst_end], data[src_begin..src_end]);
         }
         self.d.cmd_list.CopyTextureRegion(
             &.{
@@ -1384,7 +1391,7 @@ pub const Fw = struct {
                     .PlacedFootprint = .{
                         .Offset = alloc.buffer_offset,
                         .Footprint = .{
-                            .Format = .R8G8B8A8_UNORM,
+                            .Format = tex.desc.Format,
                             .Width = @intCast(u32, tex.desc.Width),
                             .Height = @intCast(u32, tex.desc.Height),
                             .Depth = 1,

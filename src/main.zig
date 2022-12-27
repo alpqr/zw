@@ -300,7 +300,7 @@ pub fn main() !void {
     sampler_desc.AddressW = .CLAMP;
     device.CreateSampler(&sampler_desc, sampler.cpu_handle);
 
-    var image = try zstbi.Image.init("src/maps/test.png", 4);
+    var image = try zstbi.Image.init("maps/test.png", 4);
     defer image.deinit();
     const texture = try fw.createTexture2DSimple(.R8G8B8A8_UNORM, .{ .width = image.width, .height = image.height });
     var srv = try cbv_srv_uav_pool.allocate(1);
@@ -370,7 +370,7 @@ pub fn main() !void {
                 cmd_list.CopyBufferRegion(resource_pool.lookupRef(ibuf).?.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
             }
 
-            fw.uploadTexture2DSimple(texture, image, staging);
+            fw.uploadTexture2DSimple(texture, image.data, image.bytes_per_row, staging);
 
             fw.addTransitionBarrier(vbuf_color, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
             fw.addTransitionBarrier(vbuf_uv, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);

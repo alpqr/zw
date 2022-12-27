@@ -324,39 +324,13 @@ pub fn main() !void {
         srv.cpu_handle);
 
     var camera = zr.Camera { };
-    var prev_cursor_pos = w32.POINT { .x = 0, .y = 0 };
 
     while (zr.Fw.handleWindowEvents()) {
         if (try fw.beginFrame() != zr.Fw.BeginFrameResult.success) {
             continue;
         }
 
-        {
-            var cursor_pos: w32.POINT = undefined;
-            _ = w32.GetCursorPos(&cursor_pos);
-            const dx = cursor_pos.x - prev_cursor_pos.x;
-            const dy = cursor_pos.y - prev_cursor_pos.y;
-            prev_cursor_pos = cursor_pos;
-            if (w32.GetAsyncKeyState(w32.VK_LBUTTON) < 0) {
-                camera.rotate(@intToFloat(f32, dx), @intToFloat(f32, dy));
-            }
-            const speed: f32 = 0.16;
-            if (w32.GetAsyncKeyState('W') < 0) {
-                camera.moveForward(speed);
-            } else if (w32.GetAsyncKeyState('S') < 0) {
-                camera.moveBackward(speed);
-            }
-            if (w32.GetAsyncKeyState('D') < 0) {
-                camera.moveRight(speed);
-            } else if (w32.GetAsyncKeyState('A') < 0) {
-                camera.moveLeft(speed);
-            }
-            if (w32.GetAsyncKeyState('R') < 0) {
-                camera.moveUp(speed);
-            } else if (w32.GetAsyncKeyState('F') < 0) {
-                camera.moveDown(speed);
-            }
-        }
+        fw.updateCamera(&camera);
         const view_matrix = camera.getViewMatrix();
 
         const output_pixel_size = fw.getBackBufferPixelSize();
@@ -480,6 +454,13 @@ pub fn main() !void {
         try fw.beginImgui(&cbv_srv_uav_pool);
         var demoWindowOpen: bool = true;
         imgui.igShowDemoWindow(&demoWindowOpen);
+        imgui.igSetNextWindowPos(imgui.ImVec2 { .x = 50, .y = 50 }, imgui.ImGuiCond_FirstUseEver, imgui.ImVec2 { .x = 0, .y = 0 });
+        imgui.igSetNextWindowSize(imgui.ImVec2 { .x = 500, .y = 100 }, imgui.ImGuiCond_FirstUseEver);
+        var windowOpen: bool = true;
+        if (imgui.igBegin("Test", &windowOpen, imgui.ImGuiWindowFlags_None)) {
+            imgui.igText("Mouse + WASDRF to move the camera (when no ImGui window is focused)");
+            imgui.igEnd();
+        }
         try fw.endImgui();
 
         try fw.endFrame();

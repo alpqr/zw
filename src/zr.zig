@@ -686,6 +686,24 @@ pub const Fw = struct {
         p: []u8
     };
 
+    const ImguiWData = struct {
+        mouse_window: ?w32.HWND = null,
+        mouse_tracked: bool = false,
+        mouse_buttons_down: u32 = 0
+    };
+
+    const CameraWData = struct {
+        last_cursor_pos: w32.POINT,
+
+        fn init() CameraWData {
+            var pos: w32.POINT = undefined;
+            _ = w32.GetCursorPos(&pos);
+            return CameraWData {
+                .last_cursor_pos = pos
+            };
+        }
+    };
+
     const Data = struct {
         options: Options,
         instance: w32.HINSTANCE,
@@ -726,11 +744,8 @@ pub const Fw = struct {
         imgui_pipeline: ObjectHandle,
         imgui_vbuf: [max_frames_in_flight]HostVisibleBuffer,
         imgui_ibuf: [max_frames_in_flight]HostVisibleBuffer,
-        imgui_wdata: struct {
-            mouse_window: ?w32.HWND = null,
-            mouse_tracked: bool = false,
-            mouse_buttons_down: u32 = 0
-        }
+        imgui_wdata: ImguiWData,
+        camera_wdata: CameraWData
     };
     d: *Data,
 
@@ -758,6 +773,8 @@ pub const Fw = struct {
         var io = imgui.igGetIO().?;
         io.*.BackendPlatformUserData = d;
         io.*.BackendFlags |= imgui.ImGuiBackendFlags_RendererHasVtxOffset;
+        io.*.IniFilename = null;
+        io.*.FontAllowUserScaling = true;
 
         _ = w32.ole32.CoInitializeEx(null, @enumToInt(w32.COINIT_APARTMENTTHREADED) | @enumToInt(w32.COINIT_DISABLE_OLE1DDE));
         errdefer w32.ole32.CoUninitialize();
@@ -1005,6 +1022,9 @@ pub const Fw = struct {
         d.imgui_pipeline = ObjectHandle.invalid();
         d.imgui_vbuf = [_]HostVisibleBuffer { .{ .resource_handle = ObjectHandle.invalid(), .p = undefined } } ** max_frames_in_flight;
         d.imgui_ibuf = [_]HostVisibleBuffer { .{ .resource_handle = ObjectHandle.invalid(), .p = undefined } } ** max_frames_in_flight;
+
+        d.imgui_wdata = ImguiWData { };
+        d.camera_wdata = CameraWData.init();
 
         var self = Fw {
             .d = d
@@ -1606,7 +1626,7 @@ pub const Fw = struct {
             pso_desc.SampleDesc = .{ .Count = 1, .Quality = 0 };
 
             var sampler_desc = std.mem.zeroes(d3d12.STATIC_SAMPLER_DESC);
-            sampler_desc.Filter = .MIN_MAG_MIP_POINT;
+            sampler_desc.Filter = .MIN_MAG_MIP_LINEAR;
             sampler_desc.AddressU = .CLAMP;
             sampler_desc.AddressV = .CLAMP;
             sampler_desc.AddressW = .CLAMP;
@@ -2054,6 +2074,41 @@ pub const Fw = struct {
             }
         }
         return 0;
+    }
+
+    pub fn imguiHasFocus() bool {
+        return imgui.igIsWindowFocused(imgui.ImGuiFocusedFlags_AnyWindow);
+    }
+
+    pub fn updateCamera(self: *Fw, camera: *Camera) void {
+        if (imguiHasFocus()) {
+            _ = w32.GetCursorPos(&self.d.camera_wdata.last_cursor_pos);
+        } else {
+            var cursor_pos: w32.POINT = undefined;
+            _ = w32.GetCursorPos(&cursor_pos);
+            const dx = cursor_pos.x - self.d.camera_wdata.last_cursor_pos.x;
+            const dy = cursor_pos.y - self.d.camera_wdata.last_cursor_pos.y;
+            self.d.camera_wdata.last_cursor_pos = cursor_pos;
+            if (w32.GetAsyncKeyState(w32.VK_LBUTTON) < 0) {
+                camera.rotate(@intToFloat(f32, dx), @intToFloat(f32, dy));
+            }
+            const speed: f32 = 0.16;
+            if (w32.GetAsyncKeyState('W') < 0) {
+                camera.moveForward(speed);
+            } else if (w32.GetAsyncKeyState('S') < 0) {
+                camera.moveBackward(speed);
+            }
+            if (w32.GetAsyncKeyState('D') < 0) {
+                camera.moveRight(speed);
+            } else if (w32.GetAsyncKeyState('A') < 0) {
+                camera.moveLeft(speed);
+            }
+            if (w32.GetAsyncKeyState('R') < 0) {
+                camera.moveUp(speed);
+            } else if (w32.GetAsyncKeyState('F') < 0) {
+                camera.moveDown(speed);
+            }
+        }
     }
 
     pub fn handleWindowEvents() bool {

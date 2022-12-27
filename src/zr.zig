@@ -7,11 +7,14 @@ const d3d12 = zwin32.d3d12;
 const d3d12d = zwin32.d3d12d;
 const zm = @import("zmath");
 const zstbi = @import("zstbi");
-const imgui = @cImport({
+pub const imgui = @cImport({
     @cDefine("CIMGUI_DEFINE_ENUMS_AND_STRUCTS", "");
     @cDefine("CIMGUI_NO_EXPORT", "");
     @cInclude("cimgui.h");
 });
+
+const imgui_vs = @embedFile("shaders/imgui.vs.cso");
+const imgui_ps = @embedFile("shaders/imgui.ps.cso");
 
 pub const Descriptor = struct {
     cpu_handle: d3d12.CPU_DESCRIPTOR_HANDLE,
@@ -678,6 +681,11 @@ pub const Fw = struct {
         state_after: d3d12.RESOURCE_STATES
     };
 
+    const HostVisibleBuffer = struct {
+        resource_handle: ObjectHandle,
+        p: []u8
+    };
+
     const Data = struct {
         options: Options,
         instance: w32.HINSTANCE,
@@ -713,6 +721,16 @@ pub const Fw = struct {
         depth_stencil_buffer: ObjectHandle,
         dsv: Descriptor,
         current_pipeline_handle: ObjectHandle,
+        imgui_font_texture: ObjectHandle,
+        imgui_font_srv: Descriptor,
+        imgui_pipeline: ObjectHandle,
+        imgui_vbuf: [max_frames_in_flight]HostVisibleBuffer,
+        imgui_ibuf: [max_frames_in_flight]HostVisibleBuffer,
+        imgui_wdata: struct {
+            mouse_window: ?w32.HWND = null,
+            mouse_tracked: bool = false,
+            mouse_buttons_down: u32 = 0
+        }
     };
     d: *Data,
 
@@ -739,6 +757,7 @@ pub const Fw = struct {
         errdefer imgui.igDestroyContext(null);
         var io = imgui.igGetIO().?;
         io.*.BackendPlatformUserData = d;
+        io.*.BackendFlags |= imgui.ImGuiBackendFlags_RendererHasVtxOffset;
 
         _ = w32.ole32.CoInitializeEx(null, @enumToInt(w32.COINIT_APARTMENTTHREADED) | @enumToInt(w32.COINIT_DISABLE_OLE1DDE));
         errdefer w32.ole32.CoUninitialize();
@@ -980,8 +999,12 @@ pub const Fw = struct {
 
         d.depth_stencil_buffer = ObjectHandle.invalid();
         d.dsv = Descriptor.invalid();
-
         d.current_pipeline_handle = ObjectHandle.invalid();
+        d.imgui_font_texture = ObjectHandle.invalid();
+        d.imgui_font_srv = Descriptor.invalid();
+        d.imgui_pipeline = ObjectHandle.invalid();
+        d.imgui_vbuf = [_]HostVisibleBuffer { .{ .resource_handle = ObjectHandle.invalid(), .p = undefined } } ** max_frames_in_flight;
+        d.imgui_ibuf = [_]HostVisibleBuffer { .{ .resource_handle = ObjectHandle.invalid(), .p = undefined } } ** max_frames_in_flight;
 
         var self = Fw {
             .d = d
@@ -1361,6 +1384,14 @@ pub const Fw = struct {
         return std.mem.bytesAsSlice(T, @alignCast(@alignOf(T), slice));
     }
 
+    pub fn uploadBuffer(self: Fw, comptime T: type, resource_handle: ObjectHandle, data: []const T, staging: *StagingArea) void {
+        const byte_size = data.len * @sizeOf(T);
+        const alloc = staging.allocate(@intCast(u32, byte_size)).?;
+        std.mem.copy(T, alloc.castCpuSlice(T), data);
+        const dst_buffer = self.d.resource_pool.lookupRef(resource_handle).?.resource;
+        self.d.cmd_list.CopyBufferRegion(dst_buffer, 0, alloc.buffer, alloc.buffer_offset, byte_size);
+    }
+
     fn createDepthStencilBuffer(self: *Fw, pixel_size: Size) !ObjectHandle {
         var heap_properties = std.mem.zeroes(d3d12.HEAP_PROPERTIES);
         heap_properties.Type = .DEFAULT;
@@ -1474,6 +1505,403 @@ pub const Fw = struct {
             null);
     }
 
+    pub fn beginImgui(self: *Fw, cpu_cbv_srv_uav_pool: *CpuDescriptorPool) !void {
+        if (!self.d.resource_pool.isValid(self.d.imgui_font_texture)) {
+            var io = imgui.igGetIO().?;
+            var p: [*c]u8 = undefined;
+            var w: i32 = 0;
+            var h: i32 = 0;
+            imgui.ImFontAtlas_GetTexDataAsRGBA32(io.*.Fonts, &p, &w, &h, null);
+
+            var id: ?*u8 = null;
+            imgui.ImFontAtlas_SetTexID(io.*.Fonts, @ptrCast(?*anyopaque, id));
+
+            const texture = try self.createTexture2DSimple(.R8G8B8A8_UNORM, .{ .width = @intCast(u32, w),
+                                                                              .height = @intCast(u32, h) });
+            var srv = try cpu_cbv_srv_uav_pool.allocate(1);
+            self.d.device.CreateShaderResourceView(
+                self.d.resource_pool.lookupRef(texture).?.resource,
+                &.{
+                    .Format = .R8G8B8A8_UNORM,
+                    .ViewDimension = .TEXTURE2D,
+                    .Shader4ComponentMapping = d3d12.DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    .u = .{
+                        .Texture2D = .{
+                            .MostDetailedMip = 0,
+                            .MipLevels = 1,
+                            .PlaneSlice = 0,
+                            .ResourceMinLODClamp = 0.0
+                        }
+                    }
+                },
+                srv.cpu_handle);
+            const pixels = p[0..@intCast(usize, w * h * 4)];
+            self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_COPY_DEST);
+            self.recordTransitionBarriers();
+            self.uploadTexture2DSimple(texture, pixels, @intCast(u32, w * 4), self.getCurrentSmallStagingArea());
+            self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            self.recordTransitionBarriers();
+
+            self.d.imgui_font_texture = texture;
+            self.d.imgui_font_srv = srv;
+        }
+
+        if (!self.d.pipeline_pool.isValid(self.d.imgui_pipeline)) {
+            const input_element_descs = [_]d3d12.INPUT_ELEMENT_DESC {
+                d3d12.INPUT_ELEMENT_DESC {
+                    .SemanticName = "POSITION",
+                    .SemanticIndex = 0,
+                    .Format = .R32G32_FLOAT,
+                    .InputSlot = 0,
+                    .AlignedByteOffset = 0,
+                    .InputSlotClass = .PER_VERTEX_DATA,
+                    .InstanceDataStepRate = 0
+                },
+                d3d12.INPUT_ELEMENT_DESC {
+                    .SemanticName = "TEXCOORD",
+                    .SemanticIndex = 0,
+                    .Format = .R32G32_FLOAT,
+                    .InputSlot = 0,
+                    .AlignedByteOffset = 2 * @sizeOf(f32),
+                    .InputSlotClass = .PER_VERTEX_DATA,
+                    .InstanceDataStepRate = 0
+                },
+                d3d12.INPUT_ELEMENT_DESC {
+                    .SemanticName = "TEXCOORD",
+                    .SemanticIndex = 1,
+                    .Format = .R8G8B8A8_UNORM,
+                    .InputSlot = 0,
+                    .AlignedByteOffset = 4 * @sizeOf(f32),
+                    .InputSlotClass = .PER_VERTEX_DATA,
+                    .InstanceDataStepRate = 0
+                },
+            };
+            var pso_desc = std.mem.zeroes(d3d12.GRAPHICS_PIPELINE_STATE_DESC);
+            pso_desc.InputLayout = .{
+                .pInputElementDescs = &input_element_descs,
+                .NumElements = input_element_descs.len
+            };
+            pso_desc.VS = .{
+                .pShaderBytecode = imgui_vs,
+                .BytecodeLength = imgui_vs.len
+            };
+            pso_desc.PS = .{
+                .pShaderBytecode = imgui_ps,
+                .BytecodeLength = imgui_ps.len
+            };
+            pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+            pso_desc.BlendState.RenderTarget[0].BlendEnable = w32.TRUE;
+            pso_desc.BlendState.RenderTarget[0].SrcBlend = .SRC_ALPHA;
+            pso_desc.BlendState.RenderTarget[0].DestBlend = .INV_SRC_ALPHA;
+            pso_desc.BlendState.RenderTarget[0].BlendOp = .ADD;
+            pso_desc.BlendState.RenderTarget[0].SrcBlendAlpha = .INV_SRC_ALPHA;
+            pso_desc.BlendState.RenderTarget[0].DestBlendAlpha = .ZERO;
+            pso_desc.BlendState.RenderTarget[0].BlendOpAlpha = .ADD;
+            pso_desc.SampleMask = 0xFFFFFFFF;
+            pso_desc.RasterizerState.FillMode = .SOLID;
+            pso_desc.RasterizerState.CullMode = .NONE;
+            pso_desc.PrimitiveTopologyType = .TRIANGLE;
+            pso_desc.NumRenderTargets = 1;
+            pso_desc.RTVFormats[0] = .R8G8B8A8_UNORM;
+            pso_desc.SampleDesc = .{ .Count = 1, .Quality = 0 };
+
+            var sampler_desc = std.mem.zeroes(d3d12.STATIC_SAMPLER_DESC);
+            sampler_desc.Filter = .MIN_MAG_MIP_POINT;
+            sampler_desc.AddressU = .CLAMP;
+            sampler_desc.AddressV = .CLAMP;
+            sampler_desc.AddressW = .CLAMP;
+            sampler_desc.ShaderRegister = 0; // s0
+            sampler_desc.ShaderVisibility = .PIXEL;
+
+            const rs_desc = d3d12.VERSIONED_ROOT_SIGNATURE_DESC {
+                .Version = d3d12.ROOT_SIGNATURE_VERSION.VERSION_1_1,
+                .u = .{
+                    .Desc_1_1 = .{
+                        .NumParameters = 2,
+                        .pParameters = &[_]d3d12.ROOT_PARAMETER1 {
+                            .{
+                                .ParameterType = .CBV,
+                                .u = .{
+                                    .Descriptor = .{
+                                        .ShaderRegister = 0, // b0
+                                        .RegisterSpace = 0,
+                                        .Flags = d3d12.ROOT_DESCRIPTOR_FLAG_NONE
+                                    }
+                                },
+                                .ShaderVisibility = .VERTEX
+                            },
+                            .{
+                                .ParameterType = .DESCRIPTOR_TABLE,
+                                .u = .{
+                                    .DescriptorTable = .{
+                                        .NumDescriptorRanges = 1,
+                                        .pDescriptorRanges = &[_]d3d12.DESCRIPTOR_RANGE1 {
+                                            .{
+                                                .RangeType = .SRV,
+                                                .NumDescriptors = 1,
+                                                .BaseShaderRegister = 0, // t0
+                                                .RegisterSpace = 0,
+                                                .Flags = d3d12.DESCRIPTOR_RANGE_FLAG_NONE,
+                                                .OffsetInDescriptorsFromTableStart = 0
+                                            }
+                                        }
+                                    }
+                                },
+                                .ShaderVisibility = .PIXEL
+                            }
+                        },
+                        .NumStaticSamplers = 1,
+                        .pStaticSamplers = &[_]d3d12.STATIC_SAMPLER_DESC {
+                            sampler_desc
+                        },
+                        .Flags = d3d12.ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+                    }
+                }
+            };
+
+            self.d.imgui_pipeline = try self.lookupOrCreateGraphicsPipeline(&pso_desc, &rs_desc);
+        }
+
+        var io = imgui.igGetIO().?;
+        io.*.DisplaySize = imgui.ImVec2 {
+            .x = @intToFloat(f32, self.d.swapchain_size.width),
+            .y = @intToFloat(f32, self.d.swapchain_size.height)
+        };
+        imgui.igNewFrame();
+    }
+
+    pub fn endImgui(self: *Fw) !void {
+        imgui.igRender();
+        const draw_data = imgui.igGetDrawData();
+        if (draw_data == null or draw_data.?.*.TotalVtxCount == 0) {
+            return;
+        }
+
+        const num_vertices = @intCast(u32, draw_data.?.*.TotalVtxCount);
+        const vbuf_byte_size = num_vertices * @sizeOf(imgui.ImDrawVert);
+        var imgui_vbuf: *HostVisibleBuffer = &self.d.imgui_vbuf[self.d.current_frame_slot];
+        const num_indices = @intCast(u32, draw_data.?.*.TotalIdxCount);
+        const ibuf_byte_size = num_indices * @sizeOf(imgui.ImDrawIdx);
+        var imgui_ibuf: *HostVisibleBuffer = &self.d.imgui_ibuf[self.d.current_frame_slot];
+        if (self.d.resource_pool.lookupRef(imgui_vbuf.resource_handle)) |vbuf| {
+            if (vbuf.desc.Width < vbuf_byte_size) {
+                self.d.resource_pool.remove(imgui_vbuf.resource_handle);
+            }
+        }
+        if (self.d.resource_pool.lookupRef(imgui_ibuf.resource_handle)) |ibuf| {
+            if (ibuf.desc.Width < ibuf_byte_size) {
+                self.d.resource_pool.remove(imgui_ibuf.resource_handle);
+            }
+        }
+        if (!self.d.resource_pool.isValid(imgui_vbuf.resource_handle)) {
+            imgui_vbuf.resource_handle = try self.createBuffer(.UPLOAD, vbuf_byte_size);
+            errdefer self.d.resource_pool.remove(imgui_vbuf.resource_handle);
+            imgui_vbuf.p = try self.mapBuffer(u8, imgui_vbuf.resource_handle);
+        }
+        if (!self.d.resource_pool.isValid(imgui_ibuf.resource_handle)) {
+            imgui_ibuf.resource_handle = try self.createBuffer(.UPLOAD, ibuf_byte_size);
+            errdefer self.d.resource_pool.remove(imgui_ibuf.resource_handle);
+            imgui_ibuf.p = try self.mapBuffer(u8, imgui_ibuf.resource_handle);
+        }
+
+        var vdata = std.mem.bytesAsSlice(imgui.ImDrawVert, @alignCast(@alignOf(imgui.ImDrawVert), imgui_vbuf.p));
+        var idata = std.mem.bytesAsSlice(imgui.ImDrawIdx, @alignCast(@alignOf(imgui.ImDrawIdx), imgui_ibuf.p));
+        var voffset: u32 = 0;
+        var ioffset: u32 = 0;
+        var i: u32 = 0;
+        while (i < @intCast(u32, draw_data.?.*.CmdListsCount)) : (i += 1) {
+            const list = draw_data.?.*.CmdLists[i];
+            const vcount = @intCast(u32, list.*.VtxBuffer.Size);
+            std.mem.copy(imgui.ImDrawVert, vdata[voffset..voffset + vcount], list.*.VtxBuffer.Data[0..vcount]);
+            const icount = @intCast(u32, list.*.IdxBuffer.Size);
+            std.mem.copy(imgui.ImDrawIdx, idata[ioffset..ioffset + icount], list.*.IdxBuffer.Data[0..icount]);
+            voffset += vcount;
+            ioffset += icount;
+        }
+
+        self.setPipeline(self.d.imgui_pipeline);
+        self.d.cmd_list.RSSetViewports(1, &[_]d3d12.VIEWPORT {
+            .{
+                .TopLeftX = 0.0,
+                .TopLeftY = 0.0,
+                .Width = @intToFloat(f32, self.d.swapchain_size.width),
+                .Height = @intToFloat(f32, self.d.swapchain_size.height),
+                .MinDepth = 0.0,
+                .MaxDepth = 1.0
+            }
+        });
+        self.d.cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
+        self.d.cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW{.{
+            .BufferLocation = self.d.resource_pool.lookupRef(imgui_vbuf.resource_handle).?.resource.GetGPUVirtualAddress(),
+            .SizeInBytes = num_vertices * @sizeOf(imgui.ImDrawVert),
+            .StrideInBytes = @sizeOf(imgui.ImDrawVert)
+        }});
+        self.d.cmd_list.IASetIndexBuffer(&.{
+            .BufferLocation = self.d.resource_pool.lookupRef(imgui_ibuf.resource_handle).?.resource.GetGPUVirtualAddress(),
+            .SizeInBytes = num_indices * @sizeOf(imgui.ImDrawIdx),
+            .Format = if (@sizeOf(imgui.ImDrawIdx) == 2) .R16_UINT else .R32_UINT
+        });
+
+        self.d.cmd_list.SetDescriptorHeaps(1, &[_]*d3d12.IDescriptorHeap {
+            self.getShaderVisibleCbvSrvUavHeap()
+        });
+        const cbuf = self.getCurrentSmallStagingArea().allocate(64).?;
+        const m = [_]f32 { // column major
+            2.0 / @intToFloat(f32, self.d.swapchain_size.width), 0.0, 0.0, -1.0,
+            0.0, 2.0 / -@intToFloat(f32, self.d.swapchain_size.height), 0.0, 1.0,
+            0.0, 0.0, 0.5, 0.5,
+            0.0, 0.0, 0.0, 1.0
+        };
+        std.mem.copy(f32, cbuf.castCpuSlice(f32), &m);
+        self.d.cmd_list.SetGraphicsRootConstantBufferView(0, cbuf.gpu_addr);
+        const shader_visible_srv = self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(1);
+        self.d.device.CopyDescriptorsSimple(1,
+                                            shader_visible_srv.cpu_handle,
+                                            self.d.imgui_font_srv.cpu_handle,
+                                            .CBV_SRV_UAV);
+        self.d.cmd_list.SetGraphicsRootDescriptorTable(1, shader_visible_srv.gpu_handle);
+
+        voffset = 0;
+        ioffset = 0;
+        i = 0;
+        while (i < @intCast(u32, draw_data.?.*.CmdListsCount)) : (i += 1) {
+            const gui_cmd_list = draw_data.?.*.CmdLists[i];
+            var j: u32 = 0;
+            while (j < gui_cmd_list.*.CmdBuffer.Size) : (j += 1) {
+                const cmd = &gui_cmd_list.*.CmdBuffer.Data[j];
+                if (cmd.*.UserCallback == null) {
+                    const scissor_rect = d3d12.RECT {
+                        .left = @floatToInt(i32, cmd.*.ClipRect.x),
+                        .top = @floatToInt(i32, cmd.*.ClipRect.y),
+                        .right = @floatToInt(i32, cmd.*.ClipRect.z),
+                        .bottom = @floatToInt(i32, cmd.*.ClipRect.w)
+                    };
+                    if (scissor_rect.right > scissor_rect.left and scissor_rect.bottom > scissor_rect.top) {
+                        self.d.cmd_list.RSSetScissorRects(1, &[_]d3d12.RECT { scissor_rect });
+                        self.d.cmd_list.DrawIndexedInstanced(cmd.*.ElemCount, 1, cmd.*.IdxOffset + ioffset,
+                                                             @intCast(i32, cmd.*.VtxOffset + voffset), 0);
+                    }
+                }
+            }
+            voffset += @intCast(u32, gui_cmd_list.*.VtxBuffer.Size);
+            ioffset += @intCast(u32, gui_cmd_list.*.IdxBuffer.Size);
+        }
+    }
+
+    fn isVkKeyDown(vk: c_int) bool {
+        return (@bitCast(u16, w32.GetKeyState(vk)) & 0x8000) != 0;
+    }
+
+    fn vkKeyToImGuiKey(wparam: w32.WPARAM) imgui.ImGuiKey {
+        switch (wparam) {
+            w32.VK_TAB => return imgui.ImGuiKey_Tab,
+            w32.VK_LEFT => return imgui.ImGuiKey_LeftArrow,
+            w32.VK_RIGHT => return imgui.ImGuiKey_RightArrow,
+            w32.VK_UP => return imgui.ImGuiKey_UpArrow,
+            w32.VK_DOWN => return imgui.ImGuiKey_DownArrow,
+            w32.VK_PRIOR => return imgui.ImGuiKey_PageUp,
+            w32.VK_NEXT => return imgui.ImGuiKey_PageDown,
+            w32.VK_HOME => return imgui.ImGuiKey_Home,
+            w32.VK_END => return imgui.ImGuiKey_End,
+            w32.VK_INSERT => return imgui.ImGuiKey_Insert,
+            w32.VK_DELETE => return imgui.ImGuiKey_Delete,
+            w32.VK_BACK => return imgui.ImGuiKey_Backspace,
+            w32.VK_SPACE => return imgui.ImGuiKey_Space,
+            w32.VK_RETURN => return imgui.ImGuiKey_Enter,
+            w32.VK_ESCAPE => return imgui.ImGuiKey_Escape,
+            w32.VK_OEM_7 => return imgui.ImGuiKey_Apostrophe,
+            w32.VK_OEM_COMMA => return imgui.ImGuiKey_Comma,
+            w32.VK_OEM_MINUS => return imgui.ImGuiKey_Minus,
+            w32.VK_OEM_PERIOD => return imgui.ImGuiKey_Period,
+            w32.VK_OEM_2 => return imgui.ImGuiKey_Slash,
+            w32.VK_OEM_1 => return imgui.ImGuiKey_Semicolon,
+            w32.VK_OEM_PLUS => return imgui.ImGuiKey_Equal,
+            w32.VK_OEM_4 => return imgui.ImGuiKey_LeftBracket,
+            w32.VK_OEM_5 => return imgui.ImGuiKey_Backslash,
+            w32.VK_OEM_6 => return imgui.ImGuiKey_RightBracket,
+            w32.VK_OEM_3 => return imgui.ImGuiKey_GraveAccent,
+            w32.VK_CAPITAL => return imgui.ImGuiKey_CapsLock,
+            w32.VK_SCROLL => return imgui.ImGuiKey_ScrollLock,
+            w32.VK_NUMLOCK => return imgui.ImGuiKey_NumLock,
+            w32.VK_SNAPSHOT => return imgui.ImGuiKey_PrintScreen,
+            w32.VK_PAUSE => return imgui.ImGuiKey_Pause,
+            w32.VK_NUMPAD0 => return imgui.ImGuiKey_Keypad0,
+            w32.VK_NUMPAD1 => return imgui.ImGuiKey_Keypad1,
+            w32.VK_NUMPAD2 => return imgui.ImGuiKey_Keypad2,
+            w32.VK_NUMPAD3 => return imgui.ImGuiKey_Keypad3,
+            w32.VK_NUMPAD4 => return imgui.ImGuiKey_Keypad4,
+            w32.VK_NUMPAD5 => return imgui.ImGuiKey_Keypad5,
+            w32.VK_NUMPAD6 => return imgui.ImGuiKey_Keypad6,
+            w32.VK_NUMPAD7 => return imgui.ImGuiKey_Keypad7,
+            w32.VK_NUMPAD8 => return imgui.ImGuiKey_Keypad8,
+            w32.VK_NUMPAD9 => return imgui.ImGuiKey_Keypad9,
+            w32.VK_DECIMAL => return imgui.ImGuiKey_KeypadDecimal,
+            w32.VK_DIVIDE => return imgui.ImGuiKey_KeypadDivide,
+            w32.VK_MULTIPLY => return imgui.ImGuiKey_KeypadMultiply,
+            w32.VK_SUBTRACT => return imgui.ImGuiKey_KeypadSubtract,
+            w32.VK_ADD => return imgui.ImGuiKey_KeypadAdd,
+            w32.IM_VK_KEYPAD_ENTER => return imgui.ImGuiKey_KeypadEnter,
+            w32.VK_LSHIFT => return imgui.ImGuiKey_LeftShift,
+            w32.VK_LCONTROL => return imgui.ImGuiKey_LeftCtrl,
+            w32.VK_LMENU => return imgui.ImGuiKey_LeftAlt,
+            w32.VK_LWIN => return imgui.ImGuiKey_LeftSuper,
+            w32.VK_RSHIFT => return imgui.ImGuiKey_RightShift,
+            w32.VK_RCONTROL => return imgui.ImGuiKey_RightCtrl,
+            w32.VK_RMENU => return imgui.ImGuiKey_RightAlt,
+            w32.VK_RWIN => return imgui.ImGuiKey_RightSuper,
+            w32.VK_APPS => return imgui.ImGuiKey_Menu,
+            '0' => return imgui.ImGuiKey_0,
+            '1' => return imgui.ImGuiKey_1,
+            '2' => return imgui.ImGuiKey_2,
+            '3' => return imgui.ImGuiKey_3,
+            '4' => return imgui.ImGuiKey_4,
+            '5' => return imgui.ImGuiKey_5,
+            '6' => return imgui.ImGuiKey_6,
+            '7' => return imgui.ImGuiKey_7,
+            '8' => return imgui.ImGuiKey_8,
+            '9' => return imgui.ImGuiKey_9,
+            'A' => return imgui.ImGuiKey_A,
+            'B' => return imgui.ImGuiKey_B,
+            'C' => return imgui.ImGuiKey_C,
+            'D' => return imgui.ImGuiKey_D,
+            'E' => return imgui.ImGuiKey_E,
+            'F' => return imgui.ImGuiKey_F,
+            'G' => return imgui.ImGuiKey_G,
+            'H' => return imgui.ImGuiKey_H,
+            'I' => return imgui.ImGuiKey_I,
+            'J' => return imgui.ImGuiKey_J,
+            'K' => return imgui.ImGuiKey_K,
+            'L' => return imgui.ImGuiKey_L,
+            'M' => return imgui.ImGuiKey_M,
+            'N' => return imgui.ImGuiKey_N,
+            'O' => return imgui.ImGuiKey_O,
+            'P' => return imgui.ImGuiKey_P,
+            'Q' => return imgui.ImGuiKey_Q,
+            'R' => return imgui.ImGuiKey_R,
+            'S' => return imgui.ImGuiKey_S,
+            'T' => return imgui.ImGuiKey_T,
+            'U' => return imgui.ImGuiKey_U,
+            'V' => return imgui.ImGuiKey_V,
+            'W' => return imgui.ImGuiKey_W,
+            'X' => return imgui.ImGuiKey_X,
+            'Y' => return imgui.ImGuiKey_Y,
+            'Z' => return imgui.ImGuiKey_Z,
+            w32.VK_F1 => return imgui.ImGuiKey_F1,
+            w32.VK_F2 => return imgui.ImGuiKey_F2,
+            w32.VK_F3 => return imgui.ImGuiKey_F3,
+            w32.VK_F4 => return imgui.ImGuiKey_F4,
+            w32.VK_F5 => return imgui.ImGuiKey_F5,
+            w32.VK_F6 => return imgui.ImGuiKey_F6,
+            w32.VK_F7 => return imgui.ImGuiKey_F7,
+            w32.VK_F8 => return imgui.ImGuiKey_F8,
+            w32.VK_F9 => return imgui.ImGuiKey_F9,
+            w32.VK_F10 => return imgui.ImGuiKey_F10,
+            w32.VK_F11 => return imgui.ImGuiKey_F11,
+            w32.VK_F12 => return imgui.ImGuiKey_F12,
+            else => return imgui.ImGuiKey_None
+        }
+    }
+
     const PAINTSTRUCT = extern struct {
         hdc: w32.HDC,
         fErase: w32.BOOL,
@@ -1493,25 +1921,24 @@ pub const Fw = struct {
         wparam: w32.WPARAM,
         lparam: w32.LPARAM,
     ) callconv(w32.WINAPI) w32.LRESULT {
-        var dd: ?*Data = null;
-        if (imgui.igGetCurrentContext() != null) {
-            var io = imgui.igGetIO().?;
-            dd = @ptrCast(*Data, @alignCast(@alignOf(*Data), io.*.BackendPlatformUserData));
+        if (imgui.igGetCurrentContext() == null) {
+            return w32.user32.defWindowProcA(window, message, wparam, lparam);
         }
+        var io = imgui.igGetIO().?;
+        var d = @ptrCast(*Data, @alignCast(@alignOf(*Data), io.*.BackendPlatformUserData));
+
         switch (message) {
             w32.user32.WM_DESTROY => {
                 w32.user32.PostQuitMessage(0);
             },
             w32.user32.WM_SIZE => {
-                if (dd) |d| {
-                    const new_size = Size {
-                        .width = @intCast(u32, lparam & 0xFFFF),
-                        .height = @intCast(u32, lparam >> 16)
-                    };
-                    if (!std.meta.eql(d.window_size, new_size)) {
-                        d.window_size = new_size;
-                        std.debug.print("new width {} height {}\n", .{d.window_size.width, d.window_size.height});
-                    }
+                const new_size = Size {
+                    .width = @intCast(u32, lparam & 0xFFFF),
+                    .height = @intCast(u32, lparam >> 16)
+                };
+                if (!std.meta.eql(d.window_size, new_size)) {
+                    d.window_size = new_size;
+                    std.debug.print("new width {} height {}\n", .{d.window_size.width, d.window_size.height});
                 }
             },
             w32.user32.WM_PAINT => {
@@ -1520,9 +1947,111 @@ pub const Fw = struct {
                 //_ = FillRect(ps.hdc, &ps.rcPaint, @intToPtr(w32.HBRUSH, 5)); // COLOR_WINDOW
                 _ = EndPaint(window, &ps);
             },
-            else => {
+            w32.user32.WM_LBUTTONDOWN,
+            w32.user32.WM_RBUTTONDOWN,
+            w32.user32.WM_MBUTTONDOWN,
+            w32.user32.WM_LBUTTONDBLCLK,
+            w32.user32.WM_RBUTTONDBLCLK,
+            w32.user32.WM_MBUTTONDBLCLK => {
+                var button: u32 = 0;
+                if (message == w32.user32.WM_LBUTTONDOWN or message == w32.user32.WM_LBUTTONDBLCLK) button = 0;
+                if (message == w32.user32.WM_RBUTTONDOWN or message == w32.user32.WM_RBUTTONDBLCLK) button = 1;
+                if (message == w32.user32.WM_MBUTTONDOWN or message == w32.user32.WM_MBUTTONDBLCLK) button = 2;
+                if (d.imgui_wdata.mouse_buttons_down == 0 and w32.GetCapture() == null) {
+                    _ = w32.SetCapture(window);
+                }
+                d.imgui_wdata.mouse_buttons_down |= @as(u32, 1) << @intCast(u5, button);
+                imgui.ImGuiIO_AddMouseButtonEvent(io, @intCast(i32, button), true);
+            },
+            w32.user32.WM_LBUTTONUP,
+            w32.user32.WM_RBUTTONUP,
+            w32.user32.WM_MBUTTONUP => {
+                var button: u32 = 0;
+                if (message == w32.user32.WM_LBUTTONUP) button = 0;
+                if (message == w32.user32.WM_RBUTTONUP) button = 1;
+                if (message == w32.user32.WM_MBUTTONUP) button = 2;
+                d.imgui_wdata.mouse_buttons_down &= ~(@as(u32, 1) << @intCast(u5, button));
+                if (d.imgui_wdata.mouse_buttons_down == 0 and w32.GetCapture() == window) {
+                    _ = w32.ReleaseCapture();
+                }
+                imgui.ImGuiIO_AddMouseButtonEvent(io, @intCast(i32, button), false);
+            },
+            w32.user32.WM_MOUSEWHEEL => {
+                const wheel_y = @intToFloat(f32, w32.GET_WHEEL_DELTA_WPARAM(wparam)) / @intToFloat(f32, w32.WHEEL_DELTA);
+                imgui.ImGuiIO_AddMouseWheelEvent(io, 0.0, wheel_y);
+            },
+            w32.user32.WM_MOUSEMOVE => {
+                d.imgui_wdata.mouse_window = window;
+                if (!d.imgui_wdata.mouse_tracked) {
+                    _ = w32.TrackMouseEvent(&w32.TRACKMOUSEEVENT {
+                        .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+                        .dwFlags = w32.TME_LEAVE,
+                        .hwndTrack = window,
+                        .dwHoverTime = 0
+                    });
+                    d.imgui_wdata.mouse_tracked = true;
+                }
+                imgui.ImGuiIO_AddMousePosEvent(io,
+                                               @intToFloat(f32, w32.GET_X_LPARAM(lparam)),
+                                               @intToFloat(f32, w32.GET_Y_LPARAM(lparam)));
+            },
+            w32.user32.WM_MOUSELEAVE => {
+                if (d.imgui_wdata.mouse_window == window) {
+                    d.imgui_wdata.mouse_window = null;
+                }
+                d.imgui_wdata.mouse_tracked = false;
+                imgui.ImGuiIO_AddMousePosEvent(io, -imgui.igGET_FLT_MAX(), -imgui.igGET_FLT_MAX());
+            },
+            w32.user32.WM_SETFOCUS,
+            w32.user32.WM_KILLFOCUS => {
+                imgui.ImGuiIO_AddFocusEvent(io, if (message == w32.user32.WM_SETFOCUS) true else false);
+            },
+            w32.user32.WM_CHAR => {
+                if (wparam > 0 and wparam < 0x10000) {
+                    imgui.ImGuiIO_AddInputCharacterUTF16(io, @intCast(u16, wparam & 0xFFFF));
+                }
+            },
+            w32.user32.WM_KEYDOWN,
+            w32.user32.WM_KEYUP,
+            w32.user32.WM_SYSKEYDOWN,
+            w32.user32.WM_SYSKEYUP => {
+                const down = if (message == w32.user32.WM_KEYDOWN or message == w32.user32.WM_SYSKEYDOWN) true else false;
+                if (wparam < 256) {
+                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_ModCtrl, isVkKeyDown(w32.VK_CONTROL));
+                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_ModShift, isVkKeyDown(w32.VK_SHIFT));
+                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_ModAlt, isVkKeyDown(w32.VK_MENU));
+                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_ModSuper, isVkKeyDown(w32.VK_APPS));
+
+                    var vk = @intCast(i32, wparam);
+                    if (wparam == w32.VK_RETURN and (((lparam >> 16) & 0xffff) & w32.KF_EXTENDED) != 0) {
+                        vk = w32.IM_VK_KEYPAD_ENTER;
+                    }
+                    const key = vkKeyToImGuiKey(wparam);
+                    if (key != imgui.ImGuiKey_None)
+                        imgui.ImGuiIO_AddKeyEvent(io, key, down);
+
+                    if (vk == w32.VK_SHIFT) {
+                        if (isVkKeyDown(w32.VK_LSHIFT) == down)
+                            imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_LeftShift, down);
+                        if (isVkKeyDown(w32.VK_RSHIFT) == down)
+                            imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_RightShift, down);
+                    } else if (vk == w32.VK_CONTROL) {
+                        if (isVkKeyDown(w32.VK_LCONTROL) == down)
+                            imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_LeftCtrl, down);
+                        if (isVkKeyDown(w32.VK_RCONTROL) == down)
+                            imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_RightCtrl, down);
+                    } else if (vk == w32.VK_MENU) {
+                        if (isVkKeyDown(w32.VK_LMENU) == down)
+                            imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_LeftAlt, down);
+                        if (isVkKeyDown(w32.VK_RMENU) == down)
+                            imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_RightAlt, down);
+                    }
+                }
                 return w32.user32.defWindowProcA(window, message, wparam, lparam);
             },
+            else => {
+                return w32.user32.defWindowProcA(window, message, wparam, lparam);
+            }
         }
         return 0;
     }

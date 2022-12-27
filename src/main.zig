@@ -6,6 +6,7 @@ const d3d12 = zwin32.d3d12;
 const zm = @import("zmath");
 const zstbi = @import("zstbi");
 const zr = @import("zr.zig");
+const imgui = zr.imgui;
 
 const color_vs = @embedFile("shaders/color.vs.cso");
 const color_ps = @embedFile("shaders/color.ps.cso");
@@ -381,27 +382,10 @@ pub fn main() !void {
             fw.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.recordTransitionBarriers();
 
-            {
-                const byte_size = 3 * @sizeOf(VertexWithColor);
-                const alloc = staging.allocate(byte_size).?;
-                std.mem.copy(VertexWithColor, alloc.castCpuSlice(VertexWithColor), &vertices_with_color);
-                cmd_list.CopyBufferRegion(resource_pool.lookupRef(vbuf_color).?.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
-            }
-            {
-                const byte_size = 3 * @sizeOf(VertexWithUv);
-                const alloc = staging.allocate(byte_size).?;
-                std.mem.copy(VertexWithUv, alloc.castCpuSlice(VertexWithUv), &vertices_with_uv);
-                cmd_list.CopyBufferRegion(resource_pool.lookupRef(vbuf_uv).?.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
-            }
-            {
-                const byte_size = 3 * @sizeOf(u16);
-                const alloc = staging.allocate(byte_size).?;
-                var idata = alloc.castCpuSlice(u16);
-                idata[0] = 0;
-                idata[1] = 1;
-                idata[2] = 2;
-                cmd_list.CopyBufferRegion(resource_pool.lookupRef(ibuf).?.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
-            }
+            fw.uploadBuffer(VertexWithColor, vbuf_color, &vertices_with_color, staging);
+            fw.uploadBuffer(VertexWithUv, vbuf_uv, &vertices_with_uv, staging);
+            const indices = [_]u16 { 0, 1, 2};
+            fw.uploadBuffer(u16, ibuf, &indices, staging);
 
             fw.uploadTexture2DSimple(texture, image.data, image.bytes_per_row, staging);
 
@@ -492,6 +476,11 @@ pub fn main() !void {
             }
         });
         cmd_list.DrawIndexedInstanced(3, 1, 0, 0, 0);
+
+        try fw.beginImgui(&cbv_srv_uav_pool);
+        var demoWindowOpen: bool = true;
+        imgui.igShowDemoWindow(&demoWindowOpen);
+        try fw.endImgui();
 
         try fw.endFrame();
 

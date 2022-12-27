@@ -5,6 +5,7 @@ const dxgi = zwin32.dxgi;
 const d3d = zwin32.d3d;
 const d3d12 = zwin32.d3d12;
 const d3d12d = zwin32.d3d12d;
+const zm = @import("zmath");
 const zstbi = @import("zstbi");
 const imgui = @cImport({
     @cDefine("CIMGUI_DEFINE_ENUMS_AND_STRUCTS", "");
@@ -577,6 +578,76 @@ pub const Size = struct {
 
     pub fn isEmpty(self: *const Size) bool {
         return self.width == 0 or self.height == 0;
+    }
+};
+
+pub const Camera = struct {
+    pos: [3]f32 = .{ 0.0, 0.0, -10.0 },
+    forward: [3]f32 = .{ 0.0, 0.0, 1.0 },
+    pitch: f32 = 0.0,
+    yaw: f32 = 0.0,
+
+    pub fn getViewMatrix(self: *const Camera) zm.Mat {
+        return zm.lookToLh(
+            zm.load(&self.pos, zm.Vec, 3),
+            zm.load(&self.forward, zm.Vec, 3),
+            zm.f32x4(0.0, 1.0, 0.0, 0.0)
+        );
+    }
+
+    pub fn rotate(self: *Camera, dx: f32, dy: f32) void {
+        self.pitch += 0.0025 * dy;
+        self.yaw += 0.0025 * dx;
+        self.pitch = std.math.min(self.pitch, 0.48 * std.math.pi);
+        self.pitch = std.math.max(self.pitch, -0.48 * std.math.pi);
+        self.yaw = zm.modAngle(self.yaw);
+        const transform = zm.mul(zm.rotationX(self.pitch), zm.rotationY(self.yaw));
+        const forward = zm.normalize3(zm.mul(zm.f32x4(0.0, 0.0, 1.0, 0.0), transform));
+        zm.store(&self.forward, forward, 3);
+    }
+
+    pub fn moveForward(self: *Camera, speed: f32) void {
+        const forward = zm.load(&self.forward, zm.Vec, 3);
+        var pos = zm.load(&self.pos, zm.Vec, 3);
+        pos += zm.f32x4s(speed) * forward;
+        zm.store(&self.pos, pos, 3);
+    }
+
+    pub fn moveBackward(self: *Camera, speed: f32) void {
+        const forward = zm.load(&self.forward, zm.Vec, 3);
+        var pos = zm.load(&self.pos, zm.Vec, 3);
+        pos -= zm.f32x4s(speed) * forward;
+        zm.store(&self.pos, pos, 3);
+    }
+
+    pub fn moveRight(self: *Camera, speed: f32) void {
+        const forward = zm.load(&self.forward, zm.Vec, 3);
+        const right = zm.normalize3(zm.cross3(zm.f32x4(0.0, 1.0, 0.0, 0.0), forward));
+        var pos = zm.load(&self.pos, zm.Vec, 3);
+        pos += zm.f32x4s(speed) * right;
+        zm.store(&self.pos, pos, 3);
+    }
+
+    pub fn moveLeft(self: *Camera, speed: f32) void {
+        const forward = zm.load(&self.forward, zm.Vec, 3);
+        const right = zm.normalize3(zm.cross3(zm.f32x4(0.0, 1.0, 0.0, 0.0), forward));
+        var pos = zm.load(&self.pos, zm.Vec, 3);
+        pos -= zm.f32x4s(speed) * right;
+        zm.store(&self.pos, pos, 3);
+    }
+
+    pub fn moveUp(self: *Camera, speed: f32) void {
+        const up = zm.f32x4(0.0, 1.0, 0.0, 0.0);
+        var pos = zm.load(&self.pos, zm.Vec, 3);
+        pos += zm.f32x4s(speed) * up;
+        zm.store(&self.pos, pos, 3);
+    }
+
+    pub fn moveDown(self: *Camera, speed: f32) void {
+        const up = zm.f32x4(0.0, 1.0, 0.0, 0.0);
+        var pos = zm.load(&self.pos, zm.Vec, 3);
+        pos -= zm.f32x4s(speed) * up;
+        zm.store(&self.pos, pos, 3);
     }
 };
 

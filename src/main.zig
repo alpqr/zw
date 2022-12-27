@@ -266,7 +266,8 @@ pub fn main() !void {
     var ibuf = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(u16));
     var needs_upload = true;
     var rotation: f32 = 0.0;
-    var last_size_used_for_projection = zr.Size.empty();    var projection = zm.identity();
+    var last_size_used_for_projection = zr.Size.empty();
+    var projection = zm.identity();
 
     var cbv_srv_uav_pool = try zr.CpuDescriptorPool.init(allocator,
                                                          device,
@@ -321,10 +322,42 @@ pub fn main() !void {
         },
         srv.cpu_handle);
 
+    var camera = zr.Camera { };
+    var prev_cursor_pos = w32.POINT { .x = 0, .y = 0 };
+
     while (zr.Fw.handleWindowEvents()) {
         if (try fw.beginFrame() != zr.Fw.BeginFrameResult.success) {
             continue;
         }
+
+        {
+            var cursor_pos: w32.POINT = undefined;
+            _ = w32.GetCursorPos(&cursor_pos);
+            const dx = cursor_pos.x - prev_cursor_pos.x;
+            const dy = cursor_pos.y - prev_cursor_pos.y;
+            prev_cursor_pos = cursor_pos;
+            if (w32.GetAsyncKeyState(w32.VK_LBUTTON) < 0) {
+                camera.rotate(@intToFloat(f32, dx), @intToFloat(f32, dy));
+            }
+            const speed: f32 = 0.16;
+            if (w32.GetAsyncKeyState('W') < 0) {
+                camera.moveForward(speed);
+            } else if (w32.GetAsyncKeyState('S') < 0) {
+                camera.moveBackward(speed);
+            }
+            if (w32.GetAsyncKeyState('D') < 0) {
+                camera.moveRight(speed);
+            } else if (w32.GetAsyncKeyState('A') < 0) {
+                camera.moveLeft(speed);
+            }
+            if (w32.GetAsyncKeyState('R') < 0) {
+                camera.moveUp(speed);
+            } else if (w32.GetAsyncKeyState('F') < 0) {
+                camera.moveDown(speed);
+            }
+        }
+        const view_matrix = camera.getViewMatrix();
+
         const output_pixel_size = fw.getBackBufferPixelSize();
         const cmd_list = fw.getCommandList();
         // 'current' = per-frame, their start ptr is reset to zero in beginFrame()
@@ -380,10 +413,9 @@ pub fn main() !void {
         }
 
         var cb_data: CbData = undefined;
-        const model = zm.rotationY(rotation);
         {
-            const view = zm.translation(-3.0, 0.0, 5.0);
-            const modelview = zm.mul(model, view);
+            const model = zm.mul(zm.rotationY(rotation), zm.translation(-3.0, 0.0, 0.0));
+            const modelview = zm.mul(model, view_matrix);
             const mvp = zm.mul(modelview, projection);
             // Mat is stored as row major, transpose to get column major
             zm.storeMat(&cb_data.mvp, zm.transpose(mvp));
@@ -433,8 +465,8 @@ pub fn main() !void {
         cmd_list.DrawIndexedInstanced(3, 1, 0, 0, 0);
 
         {
-            const view = zm.translation(3.0, 0.0, 5.0);
-            const modelview = zm.mul(model, view);
+            const model = zm.mul(zm.rotationY(rotation), zm.translation(3.0, 0.0, 0.0));
+            const modelview = zm.mul(model, view_matrix);
             const mvp = zm.mul(modelview, projection);
             zm.storeMat(&cb_data.mvp, zm.transpose(mvp));
             std.mem.copy(u8, cbuf_p[one_cbuf_size..], std.mem.asBytes(&cb_data));
@@ -461,9 +493,9 @@ pub fn main() !void {
         });
         cmd_list.DrawIndexedInstanced(3, 1, 0, 0, 0);
 
-        rotation += 0.05;
-
         try fw.endFrame();
+
+        rotation += 0.05;
     }
 
     std.debug.print("Exiting\n", .{});

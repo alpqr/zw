@@ -9,14 +9,16 @@ const zr = @import("zr.zig");
 
 const color_vs = @embedFile("shaders/color.vs.cso");
 const color_ps = @embedFile("shaders/color.ps.cso");
+const texture_vs = @embedFile("shaders/texture.vs.cso");
+const texture_ps = @embedFile("shaders/texture.ps.cso");
 
-const Vertex = struct {
+const VertexWithColor = struct {
     position: [3]f32,
     color: [3]f32
 };
-comptime { std.debug.assert(@sizeOf([2]Vertex) == 48); }
+comptime { std.debug.assert(@sizeOf([2]VertexWithColor) == 48); }
 
-const vertices = [_]Vertex {
+const vertices_with_color = [_]VertexWithColor {
     .{
         .position = [3]f32 { -1.0, -1.0, 0.0 },
         .color = [3]f32 { 1.0, 0.0, 0.0 }
@@ -31,12 +33,33 @@ const vertices = [_]Vertex {
     }
 };
 
+const VertexWithUv = struct {
+    position: [3]f32,
+    uv: [2]f32
+};
+comptime { std.debug.assert(@sizeOf([2]VertexWithUv) == 40); }
+
+const vertices_with_uv = [_]VertexWithUv {
+    .{
+        .position = [3]f32 { -1.0, -1.0, 0.0 },
+        .uv = [2]f32 { 0.0, 1.0 }
+    },
+    .{
+        .position = [3]f32 { 1.0, -1.0, 0.0 },
+        .uv = [2]f32 { 1.0, 1.0 }
+    },
+    .{
+        .position = [3]f32 { 0.0, 1.0, 0.0 },
+        .uv = [2]f32 { 0.5, 0 }
+    }
+};
+
 const CbData = struct {
     mvp: [16]f32
 };
 comptime { std.debug.assert(@sizeOf(CbData) == 64); }
 
-fn create_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
+fn create_color_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     const input_element_descs = [_]d3d12.INPUT_ELEMENT_DESC {
         d3d12.INPUT_ELEMENT_DESC {
             .SemanticName = "POSITION",
@@ -73,7 +96,7 @@ fn create_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
     pso_desc.SampleMask = 0xFFFFFFFF;
     pso_desc.RasterizerState.FillMode = .SOLID;
-    pso_desc.RasterizerState.CullMode = .NONE; // .BACK
+    pso_desc.RasterizerState.CullMode = .NONE;
     pso_desc.RasterizerState.FrontCounterClockwise = w32.TRUE;
     pso_desc.DepthStencilState.DepthEnable = w32.TRUE;
     pso_desc.DepthStencilState.DepthWriteMask = .ALL;
@@ -91,23 +114,118 @@ fn create_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
                 .NumParameters = 1,
                 .pParameters = &[_]d3d12.ROOT_PARAMETER1 {
                     .{
-                        // .ParameterType = .CBV,
-                        // .u = .{
-                        //     .Descriptor = .{
-                        //         .ShaderRegister = 0,
-                        //         .RegisterSpace = 0,
-                        //         .Flags = d3d12.ROOT_DESCRIPTOR_FLAG_NONE
-                        //     }
-                        // },
+                        .ParameterType = .CBV,
+                        .u = .{
+                            .Descriptor = .{
+                                .ShaderRegister = 0,
+                                .RegisterSpace = 0,
+                                .Flags = d3d12.ROOT_DESCRIPTOR_FLAG_NONE
+                            }
+                        },
+                        .ShaderVisibility = .ALL
+                    }
+                },
+                .NumStaticSamplers = 0,
+                .pStaticSamplers = null,
+                .Flags = d3d12.ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+            }
+        }
+    };
+
+    return try fw.lookupOrCreateGraphicsPipeline(&pso_desc, &rs_desc);
+}
+
+fn create_texture_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
+    const input_element_descs = [_]d3d12.INPUT_ELEMENT_DESC {
+        d3d12.INPUT_ELEMENT_DESC {
+            .SemanticName = "POSITION",
+            .SemanticIndex = 0,
+            .Format = .R32G32B32_FLOAT,
+            .InputSlot = 0,
+            .AlignedByteOffset = 0,
+            .InputSlotClass = .PER_VERTEX_DATA,
+            .InstanceDataStepRate = 0
+        },
+        d3d12.INPUT_ELEMENT_DESC {
+            .SemanticName = "TEXCOORD",
+            .SemanticIndex = 0,
+            .Format = .R32G32_FLOAT,
+            .InputSlot = 0,
+            .AlignedByteOffset = 3 * @sizeOf(f32),
+            .InputSlotClass = .PER_VERTEX_DATA,
+            .InstanceDataStepRate = 0
+        }
+    };
+    var pso_desc = std.mem.zeroes(d3d12.GRAPHICS_PIPELINE_STATE_DESC);
+    pso_desc.InputLayout = .{
+        .pInputElementDescs = &input_element_descs,
+        .NumElements = input_element_descs.len
+    };
+    pso_desc.VS = .{
+        .pShaderBytecode = texture_vs,
+        .BytecodeLength = texture_vs.len
+    };
+    pso_desc.PS = .{
+        .pShaderBytecode = texture_ps,
+        .BytecodeLength = texture_ps.len
+    };
+    pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+    pso_desc.SampleMask = 0xFFFFFFFF;
+    pso_desc.RasterizerState.FillMode = .SOLID;
+    pso_desc.RasterizerState.CullMode = .NONE;
+    pso_desc.RasterizerState.FrontCounterClockwise = w32.TRUE;
+    pso_desc.DepthStencilState.DepthEnable = w32.TRUE;
+    pso_desc.DepthStencilState.DepthWriteMask = .ALL;
+    pso_desc.DepthStencilState.DepthFunc = .LESS;
+    pso_desc.PrimitiveTopologyType = .TRIANGLE;
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = .R8G8B8A8_UNORM;
+    pso_desc.DSVFormat = zr.Fw.dsv_format;
+    pso_desc.SampleDesc = .{ .Count = 1, .Quality = 0 };
+
+    const rs_desc = d3d12.VERSIONED_ROOT_SIGNATURE_DESC {
+        .Version = d3d12.ROOT_SIGNATURE_VERSION.VERSION_1_1,
+        .u = .{
+            .Desc_1_1 = .{
+                .NumParameters = 2,
+                .pParameters = &[_]d3d12.ROOT_PARAMETER1 {
+                    .{
+                        .ParameterType = .DESCRIPTOR_TABLE,
+                        .u = .{
+                            .DescriptorTable = .{
+                                .NumDescriptorRanges = 2,
+                                .pDescriptorRanges = &[_]d3d12.DESCRIPTOR_RANGE1 {
+                                    .{
+                                        .RangeType = .CBV,
+                                        .NumDescriptors = 1,
+                                        .BaseShaderRegister = 0, // b0
+                                        .RegisterSpace = 0,
+                                        .Flags = d3d12.DESCRIPTOR_RANGE_FLAG_NONE,
+                                        .OffsetInDescriptorsFromTableStart = 0
+                                    },
+                                    .{
+                                        .RangeType = .SRV,
+                                        .NumDescriptors = 1,
+                                        .BaseShaderRegister = 0, // t0
+                                        .RegisterSpace = 0,
+                                        .Flags = d3d12.DESCRIPTOR_RANGE_FLAG_NONE,
+                                        .OffsetInDescriptorsFromTableStart = 1
+                                    }
+                                }
+                            }
+                        },
+                        .ShaderVisibility = .ALL
+                    },
+                    .{
                         .ParameterType = .DESCRIPTOR_TABLE,
                         .u = .{
                             .DescriptorTable = .{
                                 .NumDescriptorRanges = 1,
                                 .pDescriptorRanges = &[_]d3d12.DESCRIPTOR_RANGE1 {
                                     .{
-                                        .RangeType = .CBV,
+                                        .RangeType = .SAMPLER,
                                         .NumDescriptors = 1,
-                                        .BaseShaderRegister = 0,
+                                        .BaseShaderRegister = 0, // s0
                                         .RegisterSpace = 0,
                                         .Flags = d3d12.DESCRIPTOR_RANGE_FLAG_NONE,
                                         .OffsetInDescriptorsFromTableStart = 0
@@ -115,7 +233,7 @@ fn create_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
                                 }
                             }
                         },
-                        .ShaderVisibility = .ALL
+                        .ShaderVisibility = .PIXEL
                     }
                 },
                 .NumStaticSamplers = 0,
@@ -141,36 +259,53 @@ pub fn main() !void {
     const device = fw.getDevice();
     const resource_pool = fw.getResourcePool();
 
-    var cbv_srv_uav_cpu_descriptor_pool = try zr.CpuDescriptorPool.init(allocator,
-                                                                        device,
-                                                                        .CBV_SRV_UAV);
-    defer cbv_srv_uav_cpu_descriptor_pool.deinit();
-
-    const pipeline_handle = try create_pipeline(&fw);
-    var vbuf = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(Vertex));
+    const color_pipeline = try create_color_pipeline(&fw);
+    const texture_pipeline = try create_texture_pipeline(&fw);
+    var vbuf_color = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(VertexWithColor));
+    var vbuf_uv = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(VertexWithUv));
     var ibuf = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(u16));
     var needs_upload = true;
     var rotation: f32 = 0.0;
-    var last_size_used_for_projection = zr.Size.empty();
-    var projection = zm.identity();
+    var last_size_used_for_projection = zr.Size.empty();    var projection = zm.identity();
 
-    const cbuf_size = zr.alignedSize(@sizeOf(CbData), 256);
+    var cbv_srv_uav_pool = try zr.CpuDescriptorPool.init(allocator,
+                                                         device,
+                                                         .CBV_SRV_UAV);
+    defer cbv_srv_uav_pool.deinit();
+
+    const one_cbuf_size = zr.alignedSize(@sizeOf(CbData), 256);
+    const cbuf_size = one_cbuf_size * 2;
     var cbuf = try fw.createBuffer(.UPLOAD, cbuf_size);
     var cbuf_p = try fw.mapBuffer(u8, cbuf);
-    var cbv_cpu_descriptor = try cbv_srv_uav_cpu_descriptor_pool.allocate(1);
+    var cbv2 = try cbv_srv_uav_pool.allocate(1);
+    // Not a great strategy, but want to play with descriptor tables
+    // here so create a cbv pointing to the second set of cb data.
     device.CreateConstantBufferView(
         &.{
-            .BufferLocation = resource_pool.lookupRef(cbuf).?.resource.GetGPUVirtualAddress(),
-            .SizeInBytes = cbuf_size
+            .BufferLocation = resource_pool.lookupRef(cbuf).?.resource.GetGPUVirtualAddress() + one_cbuf_size,
+            .SizeInBytes = one_cbuf_size
         },
-        cbv_cpu_descriptor.cpu_handle);
+        cbv2.cpu_handle);
 
-    var test_image = try zstbi.Image.init("src/maps/test.png", 4);
-    defer test_image.deinit();
-    const test_texture = try fw.createTexture2D(.R8G8B8A8_UNORM, .{ .width = test_image.width, .height = test_image.height }, 1);
-    var test_srv = try cbv_srv_uav_cpu_descriptor_pool.allocate(1);
+    // No static samplers, make it more difficult.
+    var sampler_pool = try zr.CpuDescriptorPool.init(allocator,
+                                                     device,
+                                                     .SAMPLER);
+    defer sampler_pool.deinit();
+    var sampler = try sampler_pool.allocate(1);
+    var sampler_desc = std.mem.zeroes(d3d12.SAMPLER_DESC);
+    sampler_desc.Filter = .MIN_MAG_MIP_POINT;
+    sampler_desc.AddressU = .CLAMP;
+    sampler_desc.AddressV = .CLAMP;
+    sampler_desc.AddressW = .CLAMP;
+    device.CreateSampler(&sampler_desc, sampler.cpu_handle);
+
+    var image = try zstbi.Image.init("src/maps/test.png", 4);
+    defer image.deinit();
+    const texture = try fw.createTexture2DSimple(.R8G8B8A8_UNORM, .{ .width = image.width, .height = image.height });
+    var srv = try cbv_srv_uav_pool.allocate(1);
     device.CreateShaderResourceView(
-        resource_pool.lookupRef(test_texture).?.resource,
+        resource_pool.lookupRef(texture).?.resource,
         &.{
             .Format = .R8G8B8A8_UNORM,
             .ViewDimension = .TEXTURE2D,
@@ -184,16 +319,18 @@ pub fn main() !void {
                 }
             }
         },
-        test_srv.cpu_handle);
+        srv.cpu_handle);
 
     while (zr.Fw.handleWindowEvents()) {
         if (try fw.beginFrame() != zr.Fw.BeginFrameResult.success) {
             continue;
         }
-        const cmd_list = fw.getCommandList();
-        const staging = fw.getCurrentSmallStagingArea();
-        const shader_visible_cbv_srv_uav = fw.getCurrentShaderVisibleDescriptorHeapRange();
         const output_pixel_size = fw.getBackBufferPixelSize();
+        const cmd_list = fw.getCommandList();
+        // 'current' = per-frame, their start ptr is reset to zero in beginFrame()
+        const staging = fw.getCurrentSmallStagingArea();
+        const shader_visible_cbv_srv_uav_heap = fw.getCurrentShaderVisibleCbvSrvUavHeapRange();
+        const shader_visible_sampler_heap = fw.getCurrentShaderVisibleSamplerHeapRange();
 
         if (!std.meta.eql(output_pixel_size, last_size_used_for_projection)) {
             last_size_used_for_projection = output_pixel_size;
@@ -205,14 +342,23 @@ pub fn main() !void {
 
         if (needs_upload) {
             needs_upload = false;
-            fw.addTransitionBarrier(vbuf, d3d12.RESOURCE_STATE_COPY_DEST);
+            fw.addTransitionBarrier(vbuf_color, d3d12.RESOURCE_STATE_COPY_DEST);
+            fw.addTransitionBarrier(vbuf_uv, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.addTransitionBarrier(ibuf, d3d12.RESOURCE_STATE_COPY_DEST);
+            fw.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.recordTransitionBarriers();
+
             {
-                const byte_size = 3 * @sizeOf(Vertex);
+                const byte_size = 3 * @sizeOf(VertexWithColor);
                 const alloc = staging.allocate(byte_size).?;
-                std.mem.copy(Vertex, alloc.castCpuSlice(Vertex), &vertices);
-                cmd_list.CopyBufferRegion(resource_pool.lookupRef(vbuf).?.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
+                std.mem.copy(VertexWithColor, alloc.castCpuSlice(VertexWithColor), &vertices_with_color);
+                cmd_list.CopyBufferRegion(resource_pool.lookupRef(vbuf_color).?.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
+            }
+            {
+                const byte_size = 3 * @sizeOf(VertexWithUv);
+                const alloc = staging.allocate(byte_size).?;
+                std.mem.copy(VertexWithUv, alloc.castCpuSlice(VertexWithUv), &vertices_with_uv);
+                cmd_list.CopyBufferRegion(resource_pool.lookupRef(vbuf_uv).?.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
             }
             {
                 const byte_size = 3 * @sizeOf(u16);
@@ -223,25 +369,26 @@ pub fn main() !void {
                 idata[2] = 2;
                 cmd_list.CopyBufferRegion(resource_pool.lookupRef(ibuf).?.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
             }
-            fw.addTransitionBarrier(vbuf, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+
+            fw.uploadTexture2DSimple(texture, image, staging);
+
+            fw.addTransitionBarrier(vbuf_color, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+            fw.addTransitionBarrier(vbuf_uv, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
             fw.addTransitionBarrier(ibuf, d3d12.RESOURCE_STATE_INDEX_BUFFER);
+            fw.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_ALL_SHADER_RESOURCE);
             fw.recordTransitionBarriers();
         }
 
-        //var cbuf_area = staging.allocate(@sizeOf(CbData)).?;
-        //zm.storeMat(cbuf_area.castCpuSlice(f32), zm.transpose(mvp));
-
         var cb_data: CbData = undefined;
         const model = zm.rotationY(rotation);
-        const view = zm.translation(0.0, 0.0, 5.0);
-        const modelview = zm.mul(model, view);
-        const mvp = zm.mul(modelview, projection);
-
-        // Mat is stored as row major, transpose to get column major
-        zm.storeMat(&cb_data.mvp, zm.transpose(mvp));
-        std.mem.copy(u8, cbuf_p, std.mem.asBytes(&cb_data));
-
-        rotation += 0.05;
+        {
+            const view = zm.translation(-3.0, 0.0, 5.0);
+            const modelview = zm.mul(model, view);
+            const mvp = zm.mul(modelview, projection);
+            // Mat is stored as row major, transpose to get column major
+            zm.storeMat(&cb_data.mvp, zm.transpose(mvp));
+            std.mem.copy(u8, cbuf_p, std.mem.asBytes(&cb_data));
+        }
 
         const rtv = fw.getBackBufferCpuDescriptorHandle();
         const dsv = fw.getDepthStencilBufferCpuDescriptorHandle();
@@ -268,30 +415,53 @@ pub fn main() !void {
             }
         });
 
-        fw.setPipeline(pipeline_handle);
-
+        fw.setPipeline(color_pipeline);
         cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
         cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
             .{
-                .BufferLocation = resource_pool.lookupRef(vbuf).?.resource.GetGPUVirtualAddress(),
-                .SizeInBytes = 3 * @sizeOf(Vertex),
-                .StrideInBytes = @sizeOf(Vertex),
+                .BufferLocation = resource_pool.lookupRef(vbuf_color).?.resource.GetGPUVirtualAddress(),
+                .SizeInBytes = 3 * @sizeOf(VertexWithColor),
+                .StrideInBytes = @sizeOf(VertexWithColor)
             }
         });
         cmd_list.IASetIndexBuffer(&.{
             .BufferLocation = resource_pool.lookupRef(ibuf).?.resource.GetGPUVirtualAddress(),
             .SizeInBytes = 3 * @sizeOf(u16),
-            .Format = .R16_UINT,
+            .Format = .R16_UINT
         });
-
-        //cmd_list.SetGraphicsRootConstantBufferView(0, cbuf_area.gpu_addr);
-        cmd_list.SetDescriptorHeaps(1, &[_]*d3d12.IDescriptorHeap {
-            fw.getShaderVisibleDescriptorHeap()
-        });
-        device.CopyDescriptorsSimple(1, shader_visible_cbv_srv_uav.get(1).cpu_handle, cbv_cpu_descriptor.cpu_handle, .CBV_SRV_UAV);
-        cmd_list.SetGraphicsRootDescriptorTable(0, shader_visible_cbv_srv_uav.at(0).gpu_handle);
-
+        cmd_list.SetGraphicsRootConstantBufferView(0, resource_pool.lookupRef(cbuf).?.resource.GetGPUVirtualAddress());
         cmd_list.DrawIndexedInstanced(3, 1, 0, 0, 0);
+
+        {
+            const view = zm.translation(3.0, 0.0, 5.0);
+            const modelview = zm.mul(model, view);
+            const mvp = zm.mul(modelview, projection);
+            zm.storeMat(&cb_data.mvp, zm.transpose(mvp));
+            std.mem.copy(u8, cbuf_p[one_cbuf_size..], std.mem.asBytes(&cb_data));
+        }
+
+        fw.setPipeline(texture_pipeline);
+        // param 0: cbv, srv
+        // param 1: sampler
+        device.CopyDescriptorsSimple(1, shader_visible_cbv_srv_uav_heap.get(1).cpu_handle, cbv2.cpu_handle, .CBV_SRV_UAV);
+        device.CopyDescriptorsSimple(1, shader_visible_cbv_srv_uav_heap.get(1).cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
+        device.CopyDescriptorsSimple(1, shader_visible_sampler_heap.get(1).cpu_handle, sampler.cpu_handle, .SAMPLER);
+        cmd_list.SetDescriptorHeaps(2, &[_]*d3d12.IDescriptorHeap {
+            fw.getShaderVisibleCbvSrvUavHeap(),
+            fw.getShaderVisibleSamplerHeap()
+        });
+        cmd_list.SetGraphicsRootDescriptorTable(0, shader_visible_cbv_srv_uav_heap.at(0).gpu_handle);
+        cmd_list.SetGraphicsRootDescriptorTable(1, shader_visible_sampler_heap.at(0).gpu_handle);
+        cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
+            .{
+                .BufferLocation = resource_pool.lookupRef(vbuf_uv).?.resource.GetGPUVirtualAddress(),
+                .SizeInBytes = 3 * @sizeOf(VertexWithUv),
+                .StrideInBytes = @sizeOf(VertexWithUv)
+            }
+        });
+        cmd_list.DrawIndexedInstanced(3, 1, 0, 0, 0);
+
+        rotation += 0.05;
 
         try fw.endFrame();
     }

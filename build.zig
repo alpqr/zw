@@ -73,6 +73,24 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
+    dxc_command = makeDxcCmd(
+        "texture.hlsl",
+        "vsMain",
+        "texture.vs.cso",
+        "vs",
+        ""
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "texture.hlsl",
+        "psMain",
+        "texture.ps.cso",
+        "ps",
+        ""
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
     return dxc_step;
 }
 

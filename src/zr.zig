@@ -568,6 +568,15 @@ pub const StagingArea = struct {
     }
 };
 
+pub const HostVisibleBuffer = struct {
+    resource_handle: ObjectHandle = ObjectHandle.invalid(),
+    p: []u8 = undefined,
+
+    pub fn ptrAs(self: *const HostVisibleBuffer, comptime T: type) []T {
+        return std.mem.bytesAsSlice(T, @alignCast(@alignOf(T), self.p));
+    }
+};
+
 pub const Size = struct {
     width: u32,
     height: u32,
@@ -679,11 +688,6 @@ pub const Fw = struct {
         resource_handle: ObjectHandle,
         state_before: d3d12.RESOURCE_STATES,
         state_after: d3d12.RESOURCE_STATES
-    };
-
-    const HostVisibleBuffer = struct {
-        resource_handle: ObjectHandle,
-        p: []u8
     };
 
     const ImguiWData = struct {
@@ -1020,8 +1024,8 @@ pub const Fw = struct {
         d.imgui_font_texture = ObjectHandle.invalid();
         d.imgui_font_srv = Descriptor.invalid();
         d.imgui_pipeline = ObjectHandle.invalid();
-        d.imgui_vbuf = [_]HostVisibleBuffer { .{ .resource_handle = ObjectHandle.invalid(), .p = undefined } } ** max_frames_in_flight;
-        d.imgui_ibuf = [_]HostVisibleBuffer { .{ .resource_handle = ObjectHandle.invalid(), .p = undefined } } ** max_frames_in_flight;
+        d.imgui_vbuf = [_]HostVisibleBuffer { .{} } ** max_frames_in_flight;
+        d.imgui_ibuf = [_]HostVisibleBuffer { .{} } ** max_frames_in_flight;
 
         d.imgui_wdata = ImguiWData { };
         d.camera_wdata = CameraWData.init();
@@ -1404,6 +1408,16 @@ pub const Fw = struct {
         return std.mem.bytesAsSlice(T, @alignCast(@alignOf(T), slice));
     }
 
+    pub fn createMappedHostVisibleBuffer(self: *Fw, size: u32) !HostVisibleBuffer {
+        const resource_handle = try self.createBuffer(.UPLOAD, size);
+        errdefer self.d.resource_pool.remove(resource_handle);
+        const p = try self.mapBuffer(u8, resource_handle);
+        return HostVisibleBuffer {
+            .resource_handle = resource_handle,
+            .p = p
+        };
+    }
+
     pub fn uploadBuffer(self: Fw, comptime T: type, resource_handle: ObjectHandle, data: []const T, staging: *StagingArea) void {
         const byte_size = data.len * @sizeOf(T);
         const alloc = staging.allocate(@intCast(u32, byte_size)).?;
@@ -1699,10 +1713,10 @@ pub const Fw = struct {
 
         const num_vertices = @intCast(u32, draw_data.?.*.TotalVtxCount);
         const vbuf_byte_size = num_vertices * @sizeOf(imgui.ImDrawVert);
-        var imgui_vbuf: *HostVisibleBuffer = &self.d.imgui_vbuf[self.d.current_frame_slot];
+        var imgui_vbuf = &self.d.imgui_vbuf[self.d.current_frame_slot];
         const num_indices = @intCast(u32, draw_data.?.*.TotalIdxCount);
         const ibuf_byte_size = num_indices * @sizeOf(imgui.ImDrawIdx);
-        var imgui_ibuf: *HostVisibleBuffer = &self.d.imgui_ibuf[self.d.current_frame_slot];
+        var imgui_ibuf = &self.d.imgui_ibuf[self.d.current_frame_slot];
         if (self.d.resource_pool.lookupRef(imgui_vbuf.resource_handle)) |vbuf| {
             if (vbuf.desc.Width < vbuf_byte_size) {
                 self.d.resource_pool.remove(imgui_vbuf.resource_handle);
@@ -1714,18 +1728,14 @@ pub const Fw = struct {
             }
         }
         if (!self.d.resource_pool.isValid(imgui_vbuf.resource_handle)) {
-            imgui_vbuf.resource_handle = try self.createBuffer(.UPLOAD, vbuf_byte_size);
-            errdefer self.d.resource_pool.remove(imgui_vbuf.resource_handle);
-            imgui_vbuf.p = try self.mapBuffer(u8, imgui_vbuf.resource_handle);
+            imgui_vbuf.* = try self.createMappedHostVisibleBuffer(vbuf_byte_size);
         }
         if (!self.d.resource_pool.isValid(imgui_ibuf.resource_handle)) {
-            imgui_ibuf.resource_handle = try self.createBuffer(.UPLOAD, ibuf_byte_size);
-            errdefer self.d.resource_pool.remove(imgui_ibuf.resource_handle);
-            imgui_ibuf.p = try self.mapBuffer(u8, imgui_ibuf.resource_handle);
+            imgui_ibuf.* = try self.createMappedHostVisibleBuffer(ibuf_byte_size);
         }
 
-        var vdata = std.mem.bytesAsSlice(imgui.ImDrawVert, @alignCast(@alignOf(imgui.ImDrawVert), imgui_vbuf.p));
-        var idata = std.mem.bytesAsSlice(imgui.ImDrawIdx, @alignCast(@alignOf(imgui.ImDrawIdx), imgui_ibuf.p));
+        var vdata = imgui_vbuf.ptrAs(imgui.ImDrawVert);
+        var idata = imgui_ibuf.ptrAs(imgui.ImDrawIdx);
         var voffset: u32 = 0;
         var ioffset: u32 = 0;
         var i: u32 = 0;
@@ -1751,11 +1761,13 @@ pub const Fw = struct {
             }
         });
         self.d.cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
-        self.d.cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW{.{
-            .BufferLocation = self.d.resource_pool.lookupRef(imgui_vbuf.resource_handle).?.resource.GetGPUVirtualAddress(),
-            .SizeInBytes = num_vertices * @sizeOf(imgui.ImDrawVert),
-            .StrideInBytes = @sizeOf(imgui.ImDrawVert)
-        }});
+        self.d.cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
+            .{
+                .BufferLocation = self.d.resource_pool.lookupRef(imgui_vbuf.resource_handle).?.resource.GetGPUVirtualAddress(),
+                .SizeInBytes = num_vertices * @sizeOf(imgui.ImDrawVert),
+                .StrideInBytes = @sizeOf(imgui.ImDrawVert)
+            }
+        });
         self.d.cmd_list.IASetIndexBuffer(&.{
             .BufferLocation = self.d.resource_pool.lookupRef(imgui_ibuf.resource_handle).?.resource.GetGPUVirtualAddress(),
             .SizeInBytes = num_indices * @sizeOf(imgui.ImDrawIdx),

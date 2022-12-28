@@ -2054,10 +2054,10 @@ pub const Fw = struct {
             w32.user32.WM_SYSKEYUP => {
                 const down = if (message == w32.user32.WM_KEYDOWN or message == w32.user32.WM_SYSKEYDOWN) true else false;
                 if (wparam < 256) {
-                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_ModCtrl, isVkKeyDown(w32.VK_CONTROL));
-                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_ModShift, isVkKeyDown(w32.VK_SHIFT));
-                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_ModAlt, isVkKeyDown(w32.VK_MENU));
-                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiKey_ModSuper, isVkKeyDown(w32.VK_APPS));
+                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiMod_Ctrl, isVkKeyDown(w32.VK_CONTROL));
+                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiMod_Shift, isVkKeyDown(w32.VK_SHIFT));
+                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiMod_Alt, isVkKeyDown(w32.VK_MENU));
+                    imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiMod_Super, isVkKeyDown(w32.VK_APPS));
 
                     var vk = @intCast(i32, wparam);
                     if (wparam == w32.VK_RETURN and (((lparam >> 16) & 0xffff) & w32.KF_EXTENDED) != 0) {

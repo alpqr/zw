@@ -690,6 +690,16 @@ pub const Fw = struct {
         state_after: d3d12.RESOURCE_STATES
     };
 
+    const DeferredReleaseEntry = struct {
+        const Type = enum {
+            Resource,
+            Pipeline
+        };
+        handle: ObjectHandle,
+        rtype: Type,
+        frame_slot_to_be_released_in: ?u32
+    };
+
     const ImguiWData = struct {
         mouse_window: ?w32.HWND = null,
         mouse_tracked: bool = false,
@@ -733,6 +743,7 @@ pub const Fw = struct {
         resource_pool: ObjectPool(Resource),
         pipeline_pool: ObjectPool(Pipeline),
         pipeline_cache: Pipeline.Cache,
+        release_queue: std.ArrayList(DeferredReleaseEntry),
         transition_resource_barriers: []TransitionResourceBarrier,
         trb_next: u32,
         small_staging_areas: [max_frames_in_flight]StagingArea,
@@ -982,6 +993,8 @@ pub const Fw = struct {
         d.pipeline_cache = Pipeline.Cache.init(allocator);
         errdefer d.pipeline_cache.deinit();
 
+        d.release_queue = std.ArrayList(DeferredReleaseEntry).init(allocator);
+
         d.transition_resource_barriers = try allocator.alloc(TransitionResourceBarrier, transition_resource_barrier_buffer_size);
         errdefer allocator.free(d.transition_resource_barriers);
         d.trb_next = 0;
@@ -1060,6 +1073,7 @@ pub const Fw = struct {
             staging_area.deinit();
         }
         self.allocator.free(self.d.transition_resource_barriers);
+        self.d.release_queue.deinit();
         self.d.pipeline_cache.deinit();
         self.d.pipeline_pool.deinit();
         self.d.resource_pool.deinit();
@@ -1261,6 +1275,7 @@ pub const Fw = struct {
 
     pub fn beginFrame(self: *Fw) !BeginFrameResult {
         self.waitGpuIfAhead();
+        self.drainReleaseQueue();
 
         if (self.d.window_size.isEmpty()) { // e.g. when minimized
             return BeginFrameResult.empty_output_size;
@@ -1280,7 +1295,6 @@ pub const Fw = struct {
                                                                     .R8G8B8A8_UNORM,
                                                                     self.d.swapchain_flags));
             try self.acquireSwapchainBuffers();
-            self.d.current_frame_slot = 0;
             try self.ensureDepthStencil();
         }
 
@@ -1317,7 +1331,7 @@ pub const Fw = struct {
 
         try zwin32.hrErrorOnFail(self.d.swapchain.Present(self.d.options.swap_interval, present_flags));
 
-        self.d.current_frame_slot = (self.d.current_frame_slot + 1) % max_frames_in_flight;
+        self.switchToNextFrameSlot();
         self.d.current_back_buffer_index = self.d.swapchain.GetCurrentBackBufferIndex();
     }
 
@@ -1337,6 +1351,59 @@ pub const Fw = struct {
 
     pub fn resetTrackedState(self: *Fw) void {
         self.d.current_pipeline_handle = ObjectHandle.invalid();
+    }
+
+    /// Can be called inside and outside of begin-endFrame. Removes
+    /// from the pool and releases the underlying native resource only
+    /// in the max_frames_in_flight'th beginFrame() counted starting
+    /// from the next endFrame().
+    pub fn deferredReleaseResource(self: *Fw, resource_handle: ObjectHandle) void {
+        self.d.release_queue.append(.{
+            .handle = resource_handle,
+            .rtype = .Resource,
+            .frame_slot_to_be_released_in = null
+        }) catch { };
+    }
+
+    pub fn deferredReleasePipeline(self: *Fw, pipeline_handle: ObjectHandle) void {
+        self.d.release_queue.append(.{
+            .handle = pipeline_handle,
+            .rtype = .Pipeline,
+            .frame_slot_to_be_released_in = null
+        }) catch { };
+    }
+
+    fn switchToNextFrameSlot(self: *Fw) void {
+        // "activate" the pending release requests
+        for (self.d.release_queue.items) |*e| {
+            if (e.frame_slot_to_be_released_in == null)
+                e.frame_slot_to_be_released_in = self.d.current_frame_slot;
+        }
+
+        self.d.current_frame_slot = (self.d.current_frame_slot + 1) % max_frames_in_flight;
+    }
+
+    fn drainReleaseQueue(self: *Fw) void {
+        if (self.d.release_queue.items.len == 0)
+            return;
+
+        var i: i32 = @intCast(i32, self.d.release_queue.items.len) - 1;
+        while (i >= 0) : (i -= 1) {
+            const idx: usize = @intCast(usize, i);
+            if (self.d.release_queue.items[idx].frame_slot_to_be_released_in) |f| {
+                if (f == self.d.current_frame_slot) {
+                    const e = self.d.release_queue.orderedRemove(idx);
+                    switch (e.rtype) {
+                        .Resource => {
+                            self.d.resource_pool.remove(e.handle);
+                        },
+                        .Pipeline => {
+                            self.d.pipeline_pool.remove(e.handle);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn lookupOrCreateGraphicsPipeline(self: *Fw,
@@ -1975,7 +2042,7 @@ pub const Fw = struct {
                 };
                 if (!std.meta.eql(d.window_size, new_size)) {
                     d.window_size = new_size;
-                    std.debug.print("new width {} height {}\n", .{d.window_size.width, d.window_size.height});
+                    //std.debug.print("new width {} height {}\n", .{d.window_size.width, d.window_size.height});
                 }
             },
             w32.user32.WM_PAINT => {

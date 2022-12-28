@@ -751,6 +751,8 @@ pub const Fw = struct {
         imgui_wdata: ImguiWData,
         camera_wdata: CameraWData
     };
+
+    allocator: std.mem.Allocator,
     d: *Data,
 
     fn fromWCHAR(work: []u8, src: []const u16) []const u8 {
@@ -1031,6 +1033,7 @@ pub const Fw = struct {
         d.camera_wdata = CameraWData.init();
 
         var self = Fw {
+            .allocator = allocator,
             .d = d
         };
 
@@ -1040,7 +1043,7 @@ pub const Fw = struct {
         return self;
     }
 
-    pub fn deinit(self: *Fw, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Fw) void {
         self.waitGpu();
         for (self.d.swapchain_buffers) |swapchain_buffer| {
             self.d.resource_pool.remove(swapchain_buffer.handle);
@@ -1056,7 +1059,7 @@ pub const Fw = struct {
         for (self.d.small_staging_areas) |*staging_area| {
             staging_area.deinit();
         }
-        allocator.free(self.d.transition_resource_barriers);
+        self.allocator.free(self.d.transition_resource_barriers);
         self.d.pipeline_cache.deinit();
         self.d.pipeline_pool.deinit();
         self.d.resource_pool.deinit();
@@ -1074,7 +1077,7 @@ pub const Fw = struct {
         _ = self.d.dxgiFactory.Release();
         imgui.igDestroyContext(null);
         zstbi.deinit();
-        allocator.destroy(self.d);
+        self.allocator.destroy(self.d);
         w32.ole32.CoUninitialize();
     }
 
@@ -1539,9 +1542,11 @@ pub const Fw = struct {
             null);
     }
 
-    pub fn beginImgui(self: *Fw, cpu_cbv_srv_uav_pool: *CpuDescriptorPool) !void {
+    pub fn beginGui(self: *Fw, cpu_cbv_srv_uav_pool: *CpuDescriptorPool) !void {
         if (!self.d.resource_pool.isValid(self.d.imgui_font_texture)) {
             var io = imgui.igGetIO().?;
+            _ = imgui.ImFontAtlas_AddFontFromFileTTF(io.*.Fonts, "fonts/RobotoMono-Medium.ttf", 20.0, null, null);
+
             var p: [*c]u8 = undefined;
             var w: i32 = 0;
             var h: i32 = 0;
@@ -1704,7 +1709,7 @@ pub const Fw = struct {
         imgui.igNewFrame();
     }
 
-    pub fn endImgui(self: *Fw) !void {
+    pub fn endGui(self: *Fw) !void {
         imgui.igRender();
         const draw_data = imgui.igGetDrawData();
         if (draw_data == null or draw_data.?.*.TotalVtxCount == 0) {

@@ -255,7 +255,7 @@ pub fn main() !void {
     var fw = try zr.Fw.init(allocator, zr.Fw.Options {
         .enable_debug_layer = true
     });
-    defer fw.deinit(allocator);
+    defer fw.deinit();
 
     const device = fw.getDevice();
     const resource_pool = fw.getResourcePool();
@@ -451,7 +451,7 @@ pub fn main() !void {
         });
         cmd_list.DrawIndexedInstanced(3, 1, 0, 0, 0);
 
-        try fw.beginImgui(&cbv_srv_uav_pool);
+        try fw.beginGui(&cbv_srv_uav_pool);
         var demoWindowOpen: bool = true;
         imgui.igShowDemoWindow(&demoWindowOpen);
         imgui.igSetNextWindowPos(imgui.ImVec2 { .x = 50, .y = 50 }, imgui.ImGuiCond_FirstUseEver, imgui.ImVec2 { .x = 0, .y = 0 });
@@ -461,7 +461,7 @@ pub fn main() !void {
             imgui.igText("Mouse + WASDRF to move the camera (when no ImGui window is focused)");
             imgui.igEnd();
         }
-        try fw.endImgui();
+        try fw.endGui();
 
         try fw.endFrame();
 

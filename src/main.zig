@@ -133,7 +133,7 @@ fn create_color_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
         }
     };
 
-    return try fw.lookupOrCreateGraphicsPipeline(&pso_desc, &rs_desc);
+    return try fw.lookupOrCreatePipeline(&pso_desc, null, &rs_desc);
 }
 
 fn create_texture_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
@@ -244,7 +244,7 @@ fn create_texture_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
         }
     };
 
-    return try fw.lookupOrCreateGraphicsPipeline(&pso_desc, &rs_desc);
+    return try fw.lookupOrCreatePipeline(&pso_desc, null, &rs_desc);
 }
 
 pub fn main() !void {
@@ -302,9 +302,10 @@ pub fn main() !void {
     sampler_desc.AddressW = .CLAMP;
     device.CreateSampler(&sampler_desc, sampler.cpu_handle);
 
-    var image = try zstbi.Image.init("maps/test.png", 4);
+    var image = try zstbi.Image.init("maps/test2.png", 4);
     defer image.deinit();
-    const texture = try fw.createTexture2DSimple(.R8G8B8A8_UNORM, .{ .width = image.width, .height = image.height });
+    const image_size = zr.Size { .width = image.width, .height = image.height };
+    const texture = try fw.createTexture2DSimple(.R8G8B8A8_UNORM, image_size, zr.mipLevelsForSize(image_size));
     var srv = try cbv_srv_uav_pool.allocate(1);
     device.CreateShaderResourceView(
         resource_pool.lookupRef(texture).?.resource,
@@ -361,13 +362,15 @@ pub fn main() !void {
             const indices = [_]u16 { 0, 1, 2};
             fw.uploadBuffer(u16, ibuf, &indices, staging);
 
-            fw.uploadTexture2DSimple(texture, image.data, image.bytes_per_row, staging);
+            fw.uploadTexture2DSimple(texture, image.data, image.bytes_per_component * image.num_components, image.bytes_per_row, staging);
 
             fw.addTransitionBarrier(vbuf_color, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
             fw.addTransitionBarrier(vbuf_uv, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
             fw.addTransitionBarrier(ibuf, d3d12.RESOURCE_STATE_INDEX_BUFFER);
             fw.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_ALL_SHADER_RESOURCE);
             fw.recordTransitionBarriers();
+
+            try fw.generateMipmaps(texture);
         }
 
         var cb_data: CbData = undefined;
@@ -433,15 +436,19 @@ pub fn main() !void {
         fw.setPipeline(texture_pipeline);
         // param 0: cbv, srv
         // param 1: sampler
-        device.CopyDescriptorsSimple(1, shader_visible_cbv_srv_uav_heap.get(1).cpu_handle, cbv2.cpu_handle, .CBV_SRV_UAV);
-        device.CopyDescriptorsSimple(1, shader_visible_cbv_srv_uav_heap.get(1).cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
-        device.CopyDescriptorsSimple(1, shader_visible_sampler_heap.get(1).cpu_handle, sampler.cpu_handle, .SAMPLER);
+        const cbv_srv_uav_start = shader_visible_cbv_srv_uav_heap.get(2);
+        var cpu_handle = cbv_srv_uav_start.cpu_handle;
+        device.CopyDescriptorsSimple(1, cpu_handle, cbv2.cpu_handle, .CBV_SRV_UAV);
+        cpu_handle.ptr += shader_visible_cbv_srv_uav_heap.descriptor_byte_size;
+        device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
+        const sampler_table_start = shader_visible_sampler_heap.get(1);
+        device.CopyDescriptorsSimple(1, sampler_table_start.cpu_handle, sampler.cpu_handle, .SAMPLER);
         cmd_list.SetDescriptorHeaps(2, &[_]*d3d12.IDescriptorHeap {
             fw.getShaderVisibleCbvSrvUavHeap(),
             fw.getShaderVisibleSamplerHeap()
         });
-        cmd_list.SetGraphicsRootDescriptorTable(0, shader_visible_cbv_srv_uav_heap.at(0).gpu_handle);
-        cmd_list.SetGraphicsRootDescriptorTable(1, shader_visible_sampler_heap.at(0).gpu_handle);
+        cmd_list.SetGraphicsRootDescriptorTable(0, cbv_srv_uav_start.gpu_handle);
+        cmd_list.SetGraphicsRootDescriptorTable(1, sampler_table_start.gpu_handle);
         cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
             .{
                 .BufferLocation = resource_pool.lookupRef(vbuf_uv).?.resource.GetGPUVirtualAddress(),

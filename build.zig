@@ -109,6 +109,15 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
     );
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
+    dxc_command = makeDxcCmd(
+        "mipmap.hlsl",
+        "csMain",
+        "mipmap.cs.cso",
+        "cs",
+        ""
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
     return dxc_step;
 }
 

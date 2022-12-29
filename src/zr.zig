@@ -560,7 +560,7 @@ pub const StagingArea = struct {
         if (self.size + alloc_size > self.capacity) {
             std.debug.print("Failed to allocate {} bytes from staging area of size {}\n",
                             .{ size, self.capacity });
-            return error.OutOfMemory;
+            return error.OutOfStagingMemory;
         }
         const offset = self.size;
         const cpu_slice = (self.mem.cpu_slice.ptr + offset)[0..size];
@@ -1545,7 +1545,7 @@ pub const Fw = struct {
     }
 
     pub fn mapBuffer(self: *const Fw, comptime T: type, resource_handle: ObjectHandle) ![]T {
-        const res = self.d.resource_pool.lookupRef(resource_handle).?;
+        const res = self.d.resource_pool.lookupRef(resource_handle) orelse return error.ResourceNotFoundInPool;
         var p: [*]u8 = undefined;
         try zwin32.hrErrorOnFail(res.resource.Map(0,  &.{ .Begin = 0, .End = 0 }, @ptrCast(*?*anyopaque, &p)));
         const slice = p[0..res.desc.Width];
@@ -1563,11 +1563,11 @@ pub const Fw = struct {
     }
 
     pub fn uploadBuffer(self: Fw, comptime T: type, resource_handle: ObjectHandle, data: []const T, staging: *StagingArea) !void {
+        const res = self.d.resource_pool.lookupRef(resource_handle) orelse return;
         const byte_size = data.len * @sizeOf(T);
         const alloc = try staging.allocate(@intCast(u32, byte_size));
         std.mem.copy(T, alloc.castCpuSlice(T), data);
-        const dst_buffer = self.d.resource_pool.lookupRef(resource_handle).?.resource;
-        self.d.cmd_list.CopyBufferRegion(dst_buffer, 0, alloc.buffer, alloc.buffer_offset, byte_size);
+        self.d.cmd_list.CopyBufferRegion(res.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
     }
 
     fn createDepthStencilBuffer(self: *Fw, pixel_size: Size) !ObjectHandle {
@@ -1642,11 +1642,7 @@ pub const Fw = struct {
                                  data_bytes_per_pixel: u32,
                                  data_bytes_per_line: u32,
                                  staging: *StagingArea) !void {
-        var tex_opt = self.d.resource_pool.lookupRef(texture);
-        if (tex_opt == null) {
-            return;
-        }
-        var tex = tex_opt.?;
+        const tex = self.d.resource_pool.lookupRef(texture) orelse return;
         var layout: [1]d3d12.PLACED_SUBRESOURCE_FOOTPRINT = undefined;
         var required_image_data_size: u64 = undefined;
         self.d.device.GetCopyableFootprints(&tex.desc, 0, 1, 0, &layout, null, null, &required_image_data_size);
@@ -1689,11 +1685,7 @@ pub const Fw = struct {
     }
 
     pub fn generateTexture2DMipmaps(self: *Fw, texture: ObjectHandle) !void {
-        const texture_res_opt = self.d.resource_pool.lookup(texture);
-        if (texture_res_opt == null) {
-            return;
-        }
-        const texture_res = texture_res_opt.?;
+        const texture_res = self.d.resource_pool.lookupRef(texture) orelse return;
         const texture_initial_state = texture_res.state;
 
         if (!self.d.pipeline_pool.isValid(self.d.mipmapgen_pipeline)) {

@@ -303,7 +303,7 @@ pub fn main() !void {
     sampler_desc.MaxLOD = std.math.floatMax(f32); // mipmapping
     device.CreateSampler(&sampler_desc, sampler.cpu_handle);
 
-    var image = try zstbi.Image.init("maps/test2.png", 4);
+    var image = try zstbi.Image.init("maps/test.png", 4);
     defer image.deinit();
     const image_size = zr.Size { .width = image.width, .height = image.height };
     const texture = try fw.createTexture2DSimple(.R8G8B8A8_UNORM, image_size, zr.mipLevelsForSize(image_size));
@@ -317,7 +317,7 @@ pub fn main() !void {
             .u = .{
                 .Texture2D = .{
                     .MostDetailedMip = 0,
-                    .MipLevels = 1,
+                    .MipLevels = resource_pool.lookupRef(texture).?.desc.MipLevels,
                     .PlaneSlice = 0,
                     .ResourceMinLODClamp = 0.0
                 }
@@ -326,6 +326,10 @@ pub fn main() !void {
         srv.cpu_handle);
 
     var camera = zr.Camera { };
+    const GuiState = struct {
+        rotate: bool = true
+    };
+    var gui_state = GuiState { };
 
     while (zr.Fw.handleWindowEvents()) {
         if (try fw.beginFrame() != zr.Fw.BeginFrameResult.success) {
@@ -463,17 +467,20 @@ pub fn main() !void {
         var demoWindowOpen: bool = true;
         imgui.igShowDemoWindow(&demoWindowOpen);
         imgui.igSetNextWindowPos(imgui.ImVec2 { .x = 0, .y = 0 }, imgui.ImGuiCond_FirstUseEver, imgui.ImVec2 { .x = 0, .y = 0 });
-        imgui.igSetNextWindowSize(imgui.ImVec2 { .x = 700, .y = 100 }, imgui.ImGuiCond_FirstUseEver);
+        imgui.igSetNextWindowSize(imgui.ImVec2 { .x = 650, .y = 100 }, imgui.ImGuiCond_FirstUseEver);
         var windowOpen: bool = true;
         if (imgui.igBegin("Test", &windowOpen, imgui.ImGuiWindowFlags_None)) {
             imgui.igText("Mouse + WASDRF to move the camera (when no ImGui window is focused)");
+            _ = imgui.igCheckbox("Rotate", &gui_state.rotate);
             imgui.igEnd();
         }
         try fw.endGui();
 
         try fw.endFrame();
 
-        rotation += 0.05;
+        if (gui_state.rotate) {
+            rotation += 0.05;
+        }
     }
 
     std.debug.print("Exiting\n", .{});

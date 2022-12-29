@@ -1224,14 +1224,37 @@ pub const Fw = struct {
         self.d.trb_next = 0;
     }
 
+    pub fn recordSubresourceTransitionBarrier(self: *Fw,
+                                              resource_handle: ObjectHandle,
+                                              subresource: u32,
+                                              state_before: d3d12.RESOURCE_STATES,
+                                              state_after: d3d12.RESOURCE_STATES) void {
+        var res = self.d.resource_pool.lookupRef(resource_handle) orelse return;
+        self.d.cmd_list.ResourceBarrier(1, &[_]d3d12.RESOURCE_BARRIER {
+            .{
+                .Type = .TRANSITION,
+                .Flags = d3d12.RESOURCE_BARRIER_FLAG_NONE,
+                .u = .{
+                    .Transition = .{
+                        .pResource = res.resource,
+                        .Subresource = subresource,
+                        .StateBefore = state_before,
+                        .StateAfter = state_after
+                    }
+                }
+            }
+        });
+    }
+
     pub fn recordUavBarrier(self: *Fw, resource_handle: ObjectHandle) void {
+        var res = self.d.resource_pool.lookupRef(resource_handle) orelse return;
         self.d.cmd_list.ResourceBarrier(1, &[_]d3d12.RESOURCE_BARRIER {
             .{
                 .Type = .UAV,
                 .Flags = d3d12.RESOURCE_BARRIER_FLAG_NONE,
                 .u = .{
                     .UAV = .{
-                        .pResource = self.d.resource_pool.lookupRef(resource_handle).?.resource
+                        .pResource = res.resource
                     }
                 }
             }
@@ -1756,47 +1779,35 @@ pub const Fw = struct {
             self.d.mipmapgen_pipeline = try self.lookupOrCreatePipeline(null, &pso_desc, &rs_desc);
         }
 
-        self.recordUavBarrier(texture);
-        self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_UNORDERED_ACCESS);
-        self.recordTransitionBarriers();
-
         self.setPipeline(self.d.mipmapgen_pipeline);
         self.d.cmd_list.SetDescriptorHeaps(1, &[_]*d3d12.IDescriptorHeap {
             self.getShaderVisibleCbvSrvUavHeap()
         });
-        const srv = self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(1);
-        self.d.device.CreateShaderResourceView(
-            texture_res.resource, &.{
-                .Format = texture_res.desc.Format,
-                .ViewDimension = .TEXTURE2D,
-                .Shader4ComponentMapping = d3d12.DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                .u = .{
-                    .Texture2D = .{
-                        .MostDetailedMip = 0,
-                        .MipLevels = texture_res.desc.MipLevels,
-                        .PlaneSlice = 0,
-                        .ResourceMinLODClamp = 0.0
-                    }
-                }
-            },
-            srv.cpu_handle);
-        self.d.cmd_list.SetComputeRootDescriptorTable(1, srv.gpu_handle);
+
+        self.recordUavBarrier(texture);
+        self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_UNORDERED_ACCESS);
+        self.recordTransitionBarriers();
 
         const descriptor_byte_size = self.getCurrentShaderVisibleCbvSrvUavHeapRange().descriptor_byte_size;
         var level: u32 = 0;
         while (level < texture_res.desc.MipLevels) {
-            const level_plus_one_mip_width = std.math.max(1, @intCast(u32, texture_res.desc.Width) >> @intCast(u5, level + 1));
-            const level_plus_one_mip_height = std.math.max(1, texture_res.desc.Height >> @intCast(u5, level + 1));
+            self.recordSubresourceTransitionBarrier(texture,
+                                                    level,
+                                                    d3d12.RESOURCE_STATE_UNORDERED_ACCESS,
+                                                    d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-            var num_mips: u32 = 4;
-            if (level + num_mips > texture_res.desc.MipLevels) {
-                num_mips = texture_res.desc.MipLevels - level;
-            }
-            if (num_mips == 1) {
-                break;
-            }
+            var level_plus_one_mip_width = @intCast(u32, texture_res.desc.Width) >> @intCast(u5, level + 1);
+            var level_plus_one_mip_height = texture_res.desc.Height >> @intCast(u5, level + 1);
+            const dw = if (level_plus_one_mip_width == 1) level_plus_one_mip_height else level_plus_one_mip_width;
+            const dh = if (level_plus_one_mip_height == 1) level_plus_one_mip_width else level_plus_one_mip_height;
+            // number of times the size can be halved while still resulting in an even dimension
+            const additional_mips = @ctz(dw | dh);
+            const num_mips: u32 = std.math.min(1 + std.math.min(3, additional_mips), texture_res.desc.MipLevels - level);
+            level_plus_one_mip_width = std.math.max(1, level_plus_one_mip_width);
+            level_plus_one_mip_height = std.math.max(1, level_plus_one_mip_height);
 
-            std.debug.print("level={} num_mips={} level_{}_size={}x{}\n", .{level, num_mips, level + 1, level_plus_one_mip_width, level_plus_one_mip_height});
+            // std.debug.print("level={} num_mips={} level_{}_size={}x{}\n",
+            //                 .{ level, num_mips, level + 1, level_plus_one_mip_width, level_plus_one_mip_height });
 
             const cbuf = try self.getCurrentSmallStagingArea().allocate(4 * 4);
             const CBufData = struct {
@@ -1816,11 +1827,30 @@ pub const Fw = struct {
             std.mem.copy(CBufData, cbuf.castCpuSlice(CBufData), &cbuf_data);
             self.d.cmd_list.SetComputeRootConstantBufferView(0, cbuf.gpu_addr);
 
+            const srv = self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(1);
+            self.d.device.CreateShaderResourceView(
+                texture_res.resource, &.{
+                    .Format = texture_res.desc.Format,
+                    .ViewDimension = .TEXTURE2D,
+                    .Shader4ComponentMapping = d3d12.DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    .u = .{
+                        .Texture2D = .{
+                            .MostDetailedMip = level,
+                            .MipLevels = 1,
+                            .PlaneSlice = 0,
+                            .ResourceMinLODClamp = 0.0
+                        }
+                    }
+                },
+                srv.cpu_handle);
+            self.d.cmd_list.SetComputeRootDescriptorTable(1, srv.gpu_handle);
+
             const uav_table_start = self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(4);
             var uav_cpu_handle = uav_table_start.cpu_handle;
             // if level is N, then need UAVs for levels N+1, ..., N+4
             var uav_idx: u32 = 0;
             while (uav_idx < 4) : (uav_idx += 1) {
+                const uav_mip_level = std.math.min(level + 1 + uav_idx, texture_res.desc.MipLevels - 1);
                 self.d.device.CreateUnorderedAccessView(
                     texture_res.resource,
                     null,
@@ -1829,19 +1859,25 @@ pub const Fw = struct {
                         .ViewDimension = .TEXTURE2D,
                         .u = .{
                             .Texture2D = .{
-                                .MipSlice = std.math.min(level + 1 + uav_idx, texture_res.desc.MipLevels - 1),
+                                .MipSlice = uav_mip_level,
                                 .PlaneSlice = 0
                             }
                         }
                     },
                     uav_cpu_handle);
                 uav_cpu_handle.ptr += descriptor_byte_size;
-                std.debug.print("  {}\n", .{std.math.min(level + 1 + uav_idx, texture_res.desc.MipLevels - 1)});
+                //std.debug.print("  {}\n", .{ uav_mip_level });
             }
             self.d.cmd_list.SetComputeRootDescriptorTable(2, uav_table_start.gpu_handle);
 
             self.d.cmd_list.Dispatch(level_plus_one_mip_width, level_plus_one_mip_height, 1);
+
             self.recordUavBarrier(texture);
+            self.recordSubresourceTransitionBarrier(texture,
+                                                    level,
+                                                    d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                    d3d12.RESOURCE_STATE_UNORDERED_ACCESS);
+
             level += num_mips;
         }
 

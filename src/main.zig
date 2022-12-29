@@ -296,10 +296,11 @@ pub fn main() !void {
     defer sampler_pool.deinit();
     var sampler = try sampler_pool.allocate(1);
     var sampler_desc = std.mem.zeroes(d3d12.SAMPLER_DESC);
-    sampler_desc.Filter = .MIN_MAG_MIP_POINT;
+    sampler_desc.Filter = .MIN_MAG_MIP_LINEAR;
     sampler_desc.AddressU = .CLAMP;
     sampler_desc.AddressV = .CLAMP;
     sampler_desc.AddressW = .CLAMP;
+    sampler_desc.MaxLOD = std.math.floatMax(f32); // mipmapping
     device.CreateSampler(&sampler_desc, sampler.cpu_handle);
 
     var image = try zstbi.Image.init("maps/test2.png", 4);
@@ -357,12 +358,12 @@ pub fn main() !void {
             fw.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.recordTransitionBarriers();
 
-            fw.uploadBuffer(VertexWithColor, vbuf_color, &vertices_with_color, staging);
-            fw.uploadBuffer(VertexWithUv, vbuf_uv, &vertices_with_uv, staging);
+            try fw.uploadBuffer(VertexWithColor, vbuf_color, &vertices_with_color, staging);
+            try fw.uploadBuffer(VertexWithUv, vbuf_uv, &vertices_with_uv, staging);
             const indices = [_]u16 { 0, 1, 2};
-            fw.uploadBuffer(u16, ibuf, &indices, staging);
+            try fw.uploadBuffer(u16, ibuf, &indices, staging);
 
-            fw.uploadTexture2DSimple(texture, image.data, image.bytes_per_component * image.num_components, image.bytes_per_row, staging);
+            try fw.uploadTexture2DSimple(texture, image.data, image.bytes_per_component * image.num_components, image.bytes_per_row, staging);
 
             fw.addTransitionBarrier(vbuf_color, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
             fw.addTransitionBarrier(vbuf_uv, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);

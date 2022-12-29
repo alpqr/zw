@@ -554,10 +554,12 @@ pub const StagingArea = struct {
         _ = self.mem.buffer.Release();
     }
 
-    pub fn allocate(self: *StagingArea, size: u32) ?Allocation {
+    pub fn allocate(self: *StagingArea, size: u32) !Allocation {
         const alloc_size = alignedSize(size, alignment);
         if (self.size + alloc_size > self.capacity) {
-            return null;
+            std.debug.print("Failed to allocate {} bytes from staging area of size {}\n",
+                            .{ size, self.capacity });
+            return error.OutOfMemory;
         }
         const offset = self.size;
         const cpu_slice = (self.mem.cpu_slice.ptr + offset)[0..size];
@@ -1222,6 +1224,20 @@ pub const Fw = struct {
         self.d.trb_next = 0;
     }
 
+    pub fn recordUavBarrier(self: *Fw, resource_handle: ObjectHandle) void {
+        self.d.cmd_list.ResourceBarrier(1, &[_]d3d12.RESOURCE_BARRIER {
+            .{
+                .Type = .UAV,
+                .Flags = d3d12.RESOURCE_BARRIER_FLAG_NONE,
+                .u = .{
+                    .UAV = .{
+                        .pResource = self.d.resource_pool.lookupRef(resource_handle).?.resource
+                    }
+                }
+            }
+        });
+    }
+
     pub fn getDevice(self: *const Fw) *d3d12.IDevice9 {
         return self.d.device;
     }
@@ -1517,9 +1533,9 @@ pub const Fw = struct {
         };
     }
 
-    pub fn uploadBuffer(self: Fw, comptime T: type, resource_handle: ObjectHandle, data: []const T, staging: *StagingArea) void {
+    pub fn uploadBuffer(self: Fw, comptime T: type, resource_handle: ObjectHandle, data: []const T, staging: *StagingArea) !void {
         const byte_size = data.len * @sizeOf(T);
-        const alloc = staging.allocate(@intCast(u32, byte_size)).?;
+        const alloc = try staging.allocate(@intCast(u32, byte_size));
         std.mem.copy(T, alloc.castCpuSlice(T), data);
         const dst_buffer = self.d.resource_pool.lookupRef(resource_handle).?.resource;
         self.d.cmd_list.CopyBufferRegion(dst_buffer, 0, alloc.buffer, alloc.buffer_offset, byte_size);
@@ -1564,6 +1580,10 @@ pub const Fw = struct {
         var heap_properties = std.mem.zeroes(d3d12.HEAP_PROPERTIES);
         heap_properties.Type = .DEFAULT;
         var resource: *d3d12.IResource = undefined;
+        var flags: d3d12.RESOURCE_FLAGS = d3d12.RESOURCE_FLAG_NONE;
+        if (mip_levels > 1) {
+            flags |= d3d12.RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        }
         try zwin32.hrErrorOnFail(self.d.device.CreateCommittedResource(
             &heap_properties,
             d3d12.HEAP_FLAG_NONE,
@@ -1577,7 +1597,7 @@ pub const Fw = struct {
                 .Format = format,
                 .SampleDesc = .{ .Count = 1, .Quality = 0 },
                 .Layout = .UNKNOWN,
-                .Flags = d3d12.RESOURCE_FLAG_NONE
+                .Flags = flags
             },
             d3d12.RESOURCE_STATE_COMMON,
             null,
@@ -1592,7 +1612,7 @@ pub const Fw = struct {
                                  data: []u8,
                                  data_bytes_per_pixel: u32,
                                  data_bytes_per_line: u32,
-                                 staging: *StagingArea) void {
+                                 staging: *StagingArea) !void {
         var tex_opt = self.d.resource_pool.lookupRef(texture);
         if (tex_opt == null) {
             return;
@@ -1603,7 +1623,7 @@ pub const Fw = struct {
         self.d.device.GetCopyableFootprints(&tex.desc, 0, 1, 0, &layout, null, null, &required_image_data_size);
         const required_bytes_per_line = layout[0].Footprint.RowPitch; // multiple of 256
         std.debug.assert(data_bytes_per_line <= required_bytes_per_line);
-        const alloc = staging.allocate(@intCast(u32, required_image_data_size)).?;
+        const alloc = try staging.allocate(@intCast(u32, required_image_data_size));
         var y: u32 = 0;
         while (y < tex.desc.Height) : (y += 1) {
             const src_begin = y * data_bytes_per_line;
@@ -1648,6 +1668,14 @@ pub const Fw = struct {
         const texture_initial_state = texture_res.state;
 
         if (!self.d.pipeline_pool.isValid(self.d.mipmapgen_pipeline)) {
+            var sampler_desc = std.mem.zeroes(d3d12.STATIC_SAMPLER_DESC);
+            sampler_desc.Filter = .MIN_MAG_MIP_LINEAR;
+            sampler_desc.AddressU = .CLAMP;
+            sampler_desc.AddressV = .CLAMP;
+            sampler_desc.AddressW = .CLAMP;
+            sampler_desc.MaxLOD = std.math.floatMax(f32);
+            sampler_desc.ShaderRegister = 0; // s0
+            sampler_desc.ShaderVisibility = .ALL;
             var pso_desc = d3d12.COMPUTE_PIPELINE_STATE_DESC {
                 .pRootSignature = null,
                 .CS = .{
@@ -1665,15 +1693,15 @@ pub const Fw = struct {
                 .Version = d3d12.ROOT_SIGNATURE_VERSION.VERSION_1_1,
                 .u = .{
                     .Desc_1_1 = .{
-                        .NumParameters = 2,
+                        .NumParameters = 3,
                         .pParameters = &[_]d3d12.ROOT_PARAMETER1 {
                             .{
-                                .ParameterType = ._32BIT_CONSTANTS,
+                                .ParameterType = .CBV,
                                 .u = .{
-                                    .Constants = .{
-                                        .ShaderRegister = 0, // b0..1
+                                    .Descriptor = .{
+                                        .ShaderRegister = 0, // b0
                                         .RegisterSpace = 0,
-                                        .Num32BitValues = 2
+                                        .Flags = d3d12.ROOT_DESCRIPTOR_FLAG_NONE
                                     }
                                 },
                                 .ShaderVisibility = .ALL
@@ -1682,7 +1710,7 @@ pub const Fw = struct {
                                 .ParameterType = .DESCRIPTOR_TABLE,
                                 .u = .{
                                     .DescriptorTable = .{
-                                        .NumDescriptorRanges = 2,
+                                        .NumDescriptorRanges = 1,
                                         .pDescriptorRanges = &[_]d3d12.DESCRIPTOR_RANGE1 {
                                             .{
                                                 .RangeType = .SRV,
@@ -1691,14 +1719,25 @@ pub const Fw = struct {
                                                 .RegisterSpace = 0,
                                                 .Flags = d3d12.DESCRIPTOR_RANGE_FLAG_NONE,
                                                 .OffsetInDescriptorsFromTableStart = 0
-                                            },
+                                            }
+                                        }
+                                    }
+                                },
+                                .ShaderVisibility = .ALL
+                            },
+                            .{
+                                .ParameterType = .DESCRIPTOR_TABLE,
+                                .u = .{
+                                    .DescriptorTable = .{
+                                        .NumDescriptorRanges = 1,
+                                        .pDescriptorRanges = &[_]d3d12.DESCRIPTOR_RANGE1 {
                                             .{
                                                 .RangeType = .UAV,
                                                 .NumDescriptors = 4,
                                                 .BaseShaderRegister = 0, // u0..3
                                                 .RegisterSpace = 0,
                                                 .Flags = d3d12.DESCRIPTOR_RANGE_FLAG_NONE,
-                                                .OffsetInDescriptorsFromTableStart = 1
+                                                .OffsetInDescriptorsFromTableStart = 0
                                             }
                                         }
                                     }
@@ -1706,8 +1745,10 @@ pub const Fw = struct {
                                 .ShaderVisibility = .ALL
                             }
                         },
-                        .NumStaticSamplers = 0,
-                        .pStaticSamplers = null,
+                        .NumStaticSamplers = 1,
+                        .pStaticSamplers = &[_]d3d12.STATIC_SAMPLER_DESC {
+                            sampler_desc
+                        },
                         .Flags = d3d12.ROOT_SIGNATURE_FLAG_NONE
                     }
                 }
@@ -1715,60 +1756,15 @@ pub const Fw = struct {
             self.d.mipmapgen_pipeline = try self.lookupOrCreatePipeline(null, &pso_desc, &rs_desc);
         }
 
-        if (texture_res.desc.Width > 8192) {
-            std.debug.print("Texture width {} is too big for mipmap generation\n", .{ texture_res.desc.Width });
-            return error.OutOfRange;
-        }
-        var width: u32 = 4096;
-        if (texture_res.desc.Width <= width)
-            width /= 2;
-        if (texture_res.desc.Width <= width)
-            width /= 2;
-        if (texture_res.desc.Height > 8192) {
-            std.debug.print("Texture height {} is too big for mipmap generation\n", .{ texture_res.desc.Height });
-            return error.OutOfRange;
-        }
-        var height: u32 = 4096;
-        if (texture_res.desc.Height <= height)
-            height /= 2;
-        if (texture_res.desc.Height <= height)
-            height /= 2;
-        var work_textures = [_]ObjectHandle { ObjectHandle.invalid() } ** 4;
-        var heap_properties = std.mem.zeroes(d3d12.HEAP_PROPERTIES);
-        heap_properties.Type = .DEFAULT;
-        for (work_textures) |_, index| {
-            var resource: *d3d12.IResource = undefined;
-            try zwin32.hrErrorOnFail(self.d.device.CreateCommittedResource(
-                &heap_properties,
-                d3d12.HEAP_FLAG_NONE,
-                &.{
-                    .Dimension = .TEXTURE2D,
-                    .Alignment = 0,
-                    .Width = width,
-                    .Height = height,
-                    .DepthOrArraySize = 1,
-                    .MipLevels = 1,
-                    .Format = texture_res.desc.Format,
-                    .SampleDesc = .{ .Count = 1, .Quality = 0 },
-                    .Layout = .UNKNOWN,
-                    .Flags = d3d12.RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-                },
-                d3d12.RESOURCE_STATE_UNORDERED_ACCESS,
-                null,
-                &d3d12.IID_IResource,
-                @ptrCast(*?*anyopaque, &resource)));
-            errdefer _ = resource.Release();
-            work_textures[index] = try Resource.addToPool(&self.d.resource_pool, resource, d3d12.RESOURCE_STATE_UNORDERED_ACCESS);
-            self.deferredReleaseResource(work_textures[index]);
-            width /= 2;
-            height /= 2;
-        }
+        self.recordUavBarrier(texture);
+        self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_UNORDERED_ACCESS);
+        self.recordTransitionBarriers();
 
-        const shader_visible_cbv_srv_uav_heap = self.getCurrentShaderVisibleCbvSrvUavHeapRange();
-        const descriptor_byte_size = shader_visible_cbv_srv_uav_heap.descriptor_byte_size;
-        const descriptor_table_start = shader_visible_cbv_srv_uav_heap.get(1 + 4); // 1 SRV, 4 UAV
-
-        const srv_cpu_handle = descriptor_table_start.cpu_handle;
+        self.setPipeline(self.d.mipmapgen_pipeline);
+        self.d.cmd_list.SetDescriptorHeaps(1, &[_]*d3d12.IDescriptorHeap {
+            self.getShaderVisibleCbvSrvUavHeap()
+        });
+        const srv = self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(1);
         self.d.device.CreateShaderResourceView(
             texture_res.resource, &.{
                 .Format = texture_res.desc.Format,
@@ -1783,72 +1779,70 @@ pub const Fw = struct {
                     }
                 }
             },
-            srv_cpu_handle);
+            srv.cpu_handle);
+        self.d.cmd_list.SetComputeRootDescriptorTable(1, srv.gpu_handle);
 
-        var uav_cpu_handle = srv_cpu_handle;
-        uav_cpu_handle.ptr += descriptor_byte_size;
-        for (work_textures) |_, index| {
-            self.d.device.CreateUnorderedAccessView(self.d.resource_pool.lookupRef(work_textures[index]).?.resource,
-                                                    null, null, uav_cpu_handle);
-            uav_cpu_handle.ptr += descriptor_byte_size;
-        }
+        const descriptor_byte_size = self.getCurrentShaderVisibleCbvSrvUavHeapRange().descriptor_byte_size;
+        var level: u32 = 0;
+        while (level < texture_res.desc.MipLevels) {
+            const level_plus_one_mip_width = std.math.max(1, @intCast(u32, texture_res.desc.Width) >> @intCast(u5, level + 1));
+            const level_plus_one_mip_height = std.math.max(1, texture_res.desc.Height >> @intCast(u5, level + 1));
 
-        self.setPipeline(self.d.mipmapgen_pipeline);
-        self.d.cmd_list.SetDescriptorHeaps(1, &[_]*d3d12.IDescriptorHeap {
-            self.getShaderVisibleCbvSrvUavHeap()
-        });
-
-        var total_num_mips: u32 = texture_res.desc.MipLevels - 1;
-        var current_src_mip_level: u32 = 0;
-        while (true) {
-            for (work_textures) |work_texture| {
-                self.addTransitionBarrier(work_texture, d3d12.RESOURCE_STATE_UNORDERED_ACCESS);
+            var num_mips: u32 = 4;
+            if (level + num_mips > texture_res.desc.MipLevels) {
+                num_mips = texture_res.desc.MipLevels - level;
             }
-            self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            self.recordTransitionBarriers();
-
-            const dispatch_num_mips = if (total_num_mips >= 4) 4 else total_num_mips;
-            self.d.cmd_list.SetComputeRoot32BitConstant(0, current_src_mip_level, 0);
-            self.d.cmd_list.SetComputeRoot32BitConstant(0, dispatch_num_mips, 1);
-            self.d.cmd_list.SetComputeRootDescriptorTable(1, descriptor_table_start.gpu_handle);
-            const num_groups_x = @intCast(u32, std.math.max(1, texture_res.desc.Width >> @intCast(u5, 3 + current_src_mip_level)));
-            const num_groups_y = std.math.max(1, texture_res.desc.Height >> @intCast(u5, 3 + current_src_mip_level));
-            self.d.cmd_list.Dispatch(num_groups_x, num_groups_y, 1);
-
-            for (work_textures) |work_texture| {
-                self.addTransitionBarrier(work_texture, d3d12.RESOURCE_STATE_COPY_SOURCE);
-            }
-            self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_COPY_DEST);
-            self.recordTransitionBarriers();
-
-            var mip_index: u32 = 0;
-            while (mip_index < dispatch_num_mips) : (mip_index += 1) {
-                const dst = d3d12.TEXTURE_COPY_LOCATION {
-                    .pResource = texture_res.resource,
-                    .Type = .SUBRESOURCE_INDEX,
-                    .u = .{ .SubresourceIndex = mip_index + 1 + current_src_mip_level }
-                };
-                const src = d3d12.TEXTURE_COPY_LOCATION {
-                    .pResource = self.d.resource_pool.lookupRef(work_textures[mip_index]).?.resource,
-                    .Type = .SUBRESOURCE_INDEX,
-                    .u = .{ .SubresourceIndex = 0 }
-                };
-                const box = d3d12.BOX {
-                    .left = 0,
-                    .top = 0,
-                    .front = 0,
-                    .right = @intCast(u32, std.math.max(1, texture_res.desc.Width >> @intCast(u5, mip_index + 1 + current_src_mip_level))),
-                    .bottom = std.math.max(1, texture_res.desc.Height >> @intCast(u5, mip_index + 1 + current_src_mip_level)),
-                    .back = 1
-                };
-                self.d.cmd_list.CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-            }
-
-            total_num_mips -= dispatch_num_mips;
-            if (total_num_mips == 0) {
+            if (num_mips == 1) {
                 break;
             }
-            current_src_mip_level += dispatch_num_mips;
+
+            std.debug.print("level={} num_mips={} level_{}_size={}x{}\n", .{level, num_mips, level + 1, level_plus_one_mip_width, level_plus_one_mip_height});
+
+            const cbuf = try self.getCurrentSmallStagingArea().allocate(4 * 4);
+            const CBufData = struct {
+                src_mip_level: u32,
+                num_mip_levels: u32,
+                texel_width: f32,
+                texel_height: f32
+            };
+            const cbuf_data = [_]CBufData {
+                .{
+                    .src_mip_level = level,
+                    .num_mip_levels = num_mips,
+                    .texel_width = 1.0 / @intToFloat(f32, level_plus_one_mip_width),
+                    .texel_height = 1.0 / @intToFloat(f32, level_plus_one_mip_height)
+                }
+            };
+            std.mem.copy(CBufData, cbuf.castCpuSlice(CBufData), &cbuf_data);
+            self.d.cmd_list.SetComputeRootConstantBufferView(0, cbuf.gpu_addr);
+
+            const uav_table_start = self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(4);
+            var uav_cpu_handle = uav_table_start.cpu_handle;
+            // if level is N, then need UAVs for levels N+1, ..., N+4
+            var uav_idx: u32 = 0;
+            while (uav_idx < 4) : (uav_idx += 1) {
+                self.d.device.CreateUnorderedAccessView(
+                    texture_res.resource,
+                    null,
+                    &.{
+                        .Format = texture_res.desc.Format,
+                        .ViewDimension = .TEXTURE2D,
+                        .u = .{
+                            .Texture2D = .{
+                                .MipSlice = std.math.min(level + 1 + uav_idx, texture_res.desc.MipLevels - 1),
+                                .PlaneSlice = 0
+                            }
+                        }
+                    },
+                    uav_cpu_handle);
+                uav_cpu_handle.ptr += descriptor_byte_size;
+                std.debug.print("  {}\n", .{std.math.min(level + 1 + uav_idx, texture_res.desc.MipLevels - 1)});
+            }
+            self.d.cmd_list.SetComputeRootDescriptorTable(2, uav_table_start.gpu_handle);
+
+            self.d.cmd_list.Dispatch(level_plus_one_mip_width, level_plus_one_mip_height, 1);
+            self.recordUavBarrier(texture);
+            level += num_mips;
         }
 
         self.addTransitionBarrier(texture, texture_initial_state);
@@ -1891,7 +1885,7 @@ pub const Fw = struct {
             const pixels = p[0..@intCast(usize, w * h * 4)];
             self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_COPY_DEST);
             self.recordTransitionBarriers();
-            self.uploadTexture2DSimple(texture, pixels, 4, @intCast(u32, w * 4), self.getCurrentSmallStagingArea());
+            try self.uploadTexture2DSimple(texture, pixels, 4, @intCast(u32, w * 4), self.getCurrentSmallStagingArea());
             self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             self.recordTransitionBarriers();
 
@@ -2096,7 +2090,7 @@ pub const Fw = struct {
         self.d.cmd_list.SetDescriptorHeaps(1, &[_]*d3d12.IDescriptorHeap {
             self.getShaderVisibleCbvSrvUavHeap()
         });
-        const cbuf = self.getCurrentSmallStagingArea().allocate(64).?;
+        const cbuf = try self.getCurrentSmallStagingArea().allocate(64);
         const m = [_]f32 { // column major
             2.0 / @intToFloat(f32, self.d.swapchain_size.width), 0.0, 0.0, -1.0,
             0.0, 2.0 / -@intToFloat(f32, self.d.swapchain_size.height), 0.0, 1.0,

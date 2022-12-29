@@ -769,6 +769,7 @@ pub const Fw = struct {
         depth_stencil_buffer: ObjectHandle,
         dsv: Descriptor,
         current_pipeline_handle: ObjectHandle,
+        imgui_font_data: ?[]u8,
         imgui_font_texture: ObjectHandle,
         imgui_font_srv: Descriptor,
         imgui_pipeline: ObjectHandle,
@@ -1053,6 +1054,7 @@ pub const Fw = struct {
         d.depth_stencil_buffer = ObjectHandle.invalid();
         d.dsv = Descriptor.invalid();
         d.current_pipeline_handle = ObjectHandle.invalid();
+        d.imgui_font_data = null;
         d.imgui_font_texture = ObjectHandle.invalid();
         d.imgui_font_srv = Descriptor.invalid();
         d.imgui_pipeline = ObjectHandle.invalid();
@@ -1077,6 +1079,9 @@ pub const Fw = struct {
         self.waitGpu();
         for (self.d.swapchain_buffers) |swapchain_buffer| {
             self.d.resource_pool.remove(swapchain_buffer.handle);
+        }
+        if (self.d.imgui_font_data) |imgui_font_data| {
+            self.allocator.free(imgui_font_data);
         }
         self.d.shader_visible_sampler_heap.deinit();
         for (self.d.shader_visible_sampler_heap_ranges) |*h| {
@@ -1889,7 +1894,18 @@ pub const Fw = struct {
     pub fn beginGui(self: *Fw, cpu_cbv_srv_uav_pool: *CpuDescriptorPool) !void {
         if (!self.d.resource_pool.isValid(self.d.imgui_font_texture)) {
             var io = imgui.igGetIO().?;
-            _ = imgui.ImFontAtlas_AddFontFromFileTTF(io.*.Fonts, "fonts/RobotoMono-Medium.ttf", 20.0, null, null);
+
+            self.d.imgui_font_data = try self.allocator.alloc(u8, imgui_font.len);
+            std.mem.copy(u8, self.d.imgui_font_data.?, imgui_font);
+            var font_conf = imgui.ImFontConfig_ImFontConfig();
+            font_conf.*.FontDataOwnedByAtlas = false;
+            _ = imgui.ImFontAtlas_AddFontFromMemoryTTF(io.*.Fonts,
+                                                       @ptrCast(?*anyopaque, self.d.imgui_font_data.?),
+                                                       imgui_font.len,
+                                                       20.0,
+                                                       font_conf,
+                                                       null);
+            imgui.ImFontConfig_destroy(font_conf);
 
             var p: [*c]u8 = undefined;
             var w: i32 = 0;

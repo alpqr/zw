@@ -2,6 +2,7 @@ const std = @import("std");
 const zwin32 = @import("libs/zwin32/build.zig");
 const zmath = @import("libs/zmath/build.zig");
 const zstbi = @import("libs/zstbi/build.zig");
+const zmesh = @import("libs/zmesh/build.zig");
 
 pub fn build(b: *std.build.Builder) void {
     const target = b.standardTargetOptions(.{});
@@ -12,6 +13,10 @@ pub fn build(b: *std.build.Builder) void {
     exe.addPackage(zwin32.pkg);
     exe.addPackage(zmath.pkg);
     exe.addPackage(zstbi.pkg);
+
+    const zmesh_options = zmesh.BuildOptionsStep.init(b, .{ .shape_use_32bit_indices = true });
+    const zmesh_pkg = zmesh.getPkg(&.{zmesh_options.getPkg()});
+    exe.addPackage(zmesh_pkg);
 
     const dxc_step = buildShaders(b);
     exe.step.dependOn(dxc_step);
@@ -30,6 +35,7 @@ pub fn build(b: *std.build.Builder) void {
     exe.linkSystemLibraryName("c++");
 
     zstbi.link(exe);
+    zmesh.link(exe, zmesh_options);
 
     exe.setTarget(target);
     exe.setBuildMode(mode);

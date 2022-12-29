@@ -777,7 +777,8 @@ pub const Fw = struct {
         imgui_ibuf: [max_frames_in_flight]HostVisibleBuffer,
         imgui_wdata: ImguiWData,
         camera_wdata: CameraWData,
-        mipmapgen_pipeline: ObjectHandle
+        mipmapgen_pipeline: ObjectHandle,
+        format_work_area: std.ArrayList(u8),
     };
 
     allocator: std.mem.Allocator,
@@ -1064,6 +1065,8 @@ pub const Fw = struct {
         d.camera_wdata = CameraWData.init();
         d.mipmapgen_pipeline = ObjectHandle.invalid();
 
+        d.format_work_area = std.ArrayList(u8).init(allocator);
+
         var self = Fw {
             .allocator = allocator,
             .d = d
@@ -1080,6 +1083,7 @@ pub const Fw = struct {
         for (self.d.swapchain_buffers) |swapchain_buffer| {
             self.d.resource_pool.remove(swapchain_buffer.handle);
         }
+        self.d.format_work_area.deinit();
         if (self.d.imgui_font_data) |imgui_font_data| {
             self.allocator.free(imgui_font_data);
         }
@@ -2448,12 +2452,12 @@ pub const Fw = struct {
         return 0;
     }
 
-    pub fn imguiHasFocus() bool {
+    pub fn guiHasFocus() bool {
         return imgui.igIsWindowFocused(imgui.ImGuiFocusedFlags_AnyWindow);
     }
 
     pub fn updateCamera(self: *Fw, camera: *Camera) void {
-        if (imguiHasFocus()) {
+        if (guiHasFocus()) {
             _ = w32.GetCursorPos(&self.d.camera_wdata.last_cursor_pos);
         } else {
             var cursor_pos: w32.POINT = undefined;
@@ -2493,5 +2497,21 @@ pub const Fw = struct {
             }
         }
         return true;
+    }
+
+    pub fn formatTemp(self: *Fw, comptime fmt: []const u8, args: anytype) []const u8 {
+        const len = std.fmt.count(fmt, args);
+        if (self.d.format_work_area.items.len < len) {
+            self.d.format_work_area.resize(len + 64) catch unreachable;
+        }
+        return std.fmt.bufPrint(self.d.format_work_area.items, fmt, args) catch unreachable;
+    }
+
+    pub fn formatTempZ(self: Fw, comptime fmt: []const u8, args: anytype) [:0]const u8 {
+        const len = std.fmt.count(fmt ++ "\x00", args);
+        if (self.d.format_work_area.items.len < len) {
+            self.d.format_work_area.resize(len + 64) catch unreachable;
+        }
+        return std.fmt.bufPrintZ(self.d.format_work_area.items, fmt, args) catch unreachable;
     }
 };

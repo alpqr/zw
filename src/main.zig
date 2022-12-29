@@ -467,11 +467,12 @@ pub fn main() !void {
         var demoWindowOpen: bool = true;
         imgui.igShowDemoWindow(&demoWindowOpen);
         imgui.igSetNextWindowPos(imgui.ImVec2 { .x = 0, .y = 0 }, imgui.ImGuiCond_FirstUseEver, imgui.ImVec2 { .x = 0, .y = 0 });
-        imgui.igSetNextWindowSize(imgui.ImVec2 { .x = 650, .y = 100 }, imgui.ImGuiCond_FirstUseEver);
+        imgui.igSetNextWindowSize(imgui.ImVec2 { .x = 650, .y = 120 }, imgui.ImGuiCond_FirstUseEver);
         var windowOpen: bool = true;
         if (imgui.igBegin("Test", &windowOpen, imgui.ImGuiWindowFlags_None)) {
             imgui.igText("Mouse + WASDRF to move the camera (when no ImGui window is focused)");
             _ = imgui.igCheckbox("Rotate", &gui_state.rotate);
+            _ = imgui.igText(fw.formatTempZ("Test formatting {} {s}", .{123, "abcd"}).ptr);
             imgui.igEnd();
         }
         try fw.endGui();

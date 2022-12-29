@@ -375,7 +375,7 @@ pub fn main() !void {
             fw.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_ALL_SHADER_RESOURCE);
             fw.recordTransitionBarriers();
 
-            try fw.generateMipmaps(texture);
+            try fw.generateTexture2DMipmaps(texture);
         }
 
         var cb_data: CbData = undefined;

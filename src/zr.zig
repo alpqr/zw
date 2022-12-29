@@ -13,6 +13,7 @@ pub const imgui = @cImport({
     @cInclude("cimgui.h");
 });
 
+const imgui_font = @embedFile("fonts/RobotoMono-Medium.ttf");
 const imgui_vs = @embedFile("shaders/imgui.vs.cso");
 const imgui_ps = @embedFile("shaders/imgui.ps.cso");
 const mipmapgen_cs = @embedFile("shaders/mipmap.cs.cso");
@@ -684,8 +685,8 @@ pub const Fw = struct {
         enable_debug_layer: bool = false,
         swap_interval: u32 = 1,
         small_staging_area_capacity_per_frame: u32 = 16 * 1024 * 1024,
-        shader_visible_cbv_srv_uav_heap_capacity_per_frame: u32 = 256,
-        shader_visible_sampler_heap_capacity_per_frame: u32 = 16,
+        shader_visible_cbv_srv_uav_heap_capacity_per_frame: u32 = 1024,
+        shader_visible_sampler_heap_capacity_per_frame: u32 = 64,
     };
 
     pub const max_frames_in_flight = 2;
@@ -1682,7 +1683,7 @@ pub const Fw = struct {
             null);
     }
 
-    pub fn generateMipmaps(self: *Fw, texture: ObjectHandle) !void {
+    pub fn generateTexture2DMipmaps(self: *Fw, texture: ObjectHandle) !void {
         const texture_res_opt = self.d.resource_pool.lookup(texture);
         if (texture_res_opt == null) {
             return;
@@ -1809,7 +1810,6 @@ pub const Fw = struct {
             // std.debug.print("level={} num_mips={} level_{}_size={}x{}\n",
             //                 .{ level, num_mips, level + 1, level_plus_one_mip_width, level_plus_one_mip_height });
 
-            const cbuf = try self.getCurrentSmallStagingArea().allocate(4 * 4);
             const CBufData = struct {
                 src_mip_level: u32,
                 num_mip_levels: u32,
@@ -1824,6 +1824,7 @@ pub const Fw = struct {
                     .texel_height = 1.0 / @intToFloat(f32, level_plus_one_mip_height)
                 }
             };
+            const cbuf = try self.getCurrentSmallStagingArea().allocate(@sizeOf(CBufData));
             std.mem.copy(CBufData, cbuf.castCpuSlice(CBufData), &cbuf_data);
             self.d.cmd_list.SetComputeRootConstantBufferView(0, cbuf.gpu_addr);
 
@@ -2077,10 +2078,12 @@ pub const Fw = struct {
             }
         }
         if (!self.d.resource_pool.isValid(imgui_vbuf.resource_handle)) {
-            imgui_vbuf.* = try self.createMappedHostVisibleBuffer(vbuf_byte_size);
+            const extra = 200 * @sizeOf(imgui.ImDrawVert);
+            imgui_vbuf.* = try self.createMappedHostVisibleBuffer(vbuf_byte_size + extra);
         }
         if (!self.d.resource_pool.isValid(imgui_ibuf.resource_handle)) {
-            imgui_ibuf.* = try self.createMappedHostVisibleBuffer(ibuf_byte_size);
+            const extra = 200 * @sizeOf(imgui.ImDrawIdx);
+            imgui_ibuf.* = try self.createMappedHostVisibleBuffer(ibuf_byte_size + extra);
         }
 
         var vdata = imgui_vbuf.ptrAs(imgui.ImDrawVert);

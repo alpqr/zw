@@ -1196,7 +1196,20 @@ pub const Fw = struct {
             self.d.dsv_pool.release(self.d.dsv, 1);
             self.d.dsv = Descriptor.invalid();
         }
-        self.d.depth_stencil_buffer = try self.createDepthStencilBuffer(self.d.swapchain_size);
+        self.d.depth_stencil_buffer = try self.createTexture2D(dsv_format,
+                                                               self.d.swapchain_size,
+                                                               1,
+                                                               d3d12.RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | d3d12.RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+                                                               d3d12.RESOURCE_STATE_DEPTH_WRITE,
+                                                               &.{
+                                                                   .Format = Fw.dsv_format,
+                                                                   .u = .{
+                                                                       .DepthStencil = .{
+                                                                           .Depth = 1.0,
+                                                                           .Stencil = 0
+                                                                       }
+                                                                   }
+        });
         self.d.dsv = try self.d.dsv_pool.allocate(1);
         self.d.device.CreateDepthStencilView(self.d.resource_pool.lookupRef(self.d.depth_stencil_buffer).?.resource,
                                              null,
@@ -1635,48 +1648,19 @@ pub const Fw = struct {
         self.d.cmd_list.CopyBufferRegion(res.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
     }
 
-    fn createDepthStencilBuffer(self: *Fw, pixel_size: Size) !ObjectHandle {
+    pub fn createTexture2D(self: *Fw,
+                           format: dxgi.FORMAT,
+                           pixel_size: Size,
+                           mip_levels: u32,
+                           flags: d3d12.RESOURCE_FLAGS,
+                           state: d3d12.RESOURCE_STATES,
+                           clear_value: ?*const d3d12.CLEAR_VALUE) !ObjectHandle {
         var heap_properties = std.mem.zeroes(d3d12.HEAP_PROPERTIES);
         heap_properties.Type = .DEFAULT;
         var resource: *d3d12.IResource = undefined;
-        try zwin32.hrErrorOnFail(self.d.device.CreateCommittedResource(
-            &heap_properties,
-            d3d12.HEAP_FLAG_NONE,
-            &.{
-                .Dimension = .TEXTURE2D,
-                .Alignment = 0,
-                .Width = pixel_size.width,
-                .Height = pixel_size.height,
-                .DepthOrArraySize = 1,
-                .MipLevels = 1,
-                .Format = Fw.dsv_format,
-                .SampleDesc = .{ .Count = 1, .Quality = 0 },
-                .Layout = .UNKNOWN,
-                .Flags = d3d12.RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | d3d12.RESOURCE_FLAG_DENY_SHADER_RESOURCE
-            },
-            d3d12.RESOURCE_STATE_DEPTH_WRITE,
-            &.{
-                .Format = Fw.dsv_format,
-                .u = .{
-                    .DepthStencil = .{
-                        .Depth = 1.0,
-                        .Stencil = 0
-                    }
-                }
-            },
-            &d3d12.IID_IResource,
-            @ptrCast(*?*anyopaque, &resource)));
-        errdefer _ = resource.Release();
-        return try Resource.addToPool(&self.d.resource_pool, resource, d3d12.RESOURCE_STATE_DEPTH_WRITE);
-    }
-
-    pub fn createTexture2DSimple(self: *Fw, format: dxgi.FORMAT, pixel_size: Size, mip_levels: u32) !ObjectHandle {
-        var heap_properties = std.mem.zeroes(d3d12.HEAP_PROPERTIES);
-        heap_properties.Type = .DEFAULT;
-        var resource: *d3d12.IResource = undefined;
-        var flags: d3d12.RESOURCE_FLAGS = d3d12.RESOURCE_FLAG_NONE;
+        var resource_flags = flags;
         if (mip_levels > 1) {
-            flags |= d3d12.RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            resource_flags |= d3d12.RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         }
         try zwin32.hrErrorOnFail(self.d.device.CreateCommittedResource(
             &heap_properties,
@@ -1691,14 +1675,21 @@ pub const Fw = struct {
                 .Format = format,
                 .SampleDesc = .{ .Count = 1, .Quality = 0 },
                 .Layout = .UNKNOWN,
-                .Flags = flags
+                .Flags = resource_flags
             },
-            d3d12.RESOURCE_STATE_COMMON,
-            null,
+            state,
+            clear_value,
             &d3d12.IID_IResource,
             @ptrCast(*?*anyopaque, &resource)));
         errdefer _ = resource.Release();
-        return try Resource.addToPool(&self.d.resource_pool, resource, d3d12.RESOURCE_STATE_COMMON);
+        return try Resource.addToPool(&self.d.resource_pool, resource, state);
+    }
+
+    pub fn createTexture2DSimple(self: *Fw,
+                                 format: dxgi.FORMAT,
+                                 pixel_size: Size,
+                                 mip_levels: u32) !ObjectHandle {
+        return self.createTexture2D(format, pixel_size, mip_levels, d3d12.RESOURCE_FLAG_NONE, d3d12.RESOURCE_STATE_COMMON, null);
     }
 
     pub fn uploadTexture2DSimple(self: *Fw,

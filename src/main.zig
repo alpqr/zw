@@ -374,14 +374,14 @@ pub fn main() !void {
         },
         cbv2.cpu_handle);
 
-    // No static sampler here, but exercise the helper so no need for a SAMPLER CpuDescriptorPool.
+    // No static sampler here, but exercise the helper.
     var sampler_desc = std.mem.zeroes(d3d12.SAMPLER_DESC);
     sampler_desc.Filter = .MIN_MAG_MIP_LINEAR;
     sampler_desc.AddressU = .CLAMP;
     sampler_desc.AddressV = .CLAMP;
     sampler_desc.AddressW = .CLAMP;
     sampler_desc.MaxLOD = std.math.floatMax(f32); // mipmapping
-    const sampler = try fw.lookupOrCreateSampler(sampler_desc);
+    const sampler = try fw.lookupOrCreateSampler(.{ .desc = sampler_desc, .stype = .ShaderVisible });
 
     var image = try zstbi.Image.init("maps/test.png", 4);
     defer image.deinit();
@@ -544,7 +544,8 @@ pub fn main() !void {
         device.CopyDescriptorsSimple(1, cpu_handle, cbv2.cpu_handle, .CBV_SRV_UAV);
         cpu_handle.ptr += shader_visible_cbv_srv_uav_heap.descriptor_byte_size;
         device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
-        // const sampler_table_start = shader_visible_sampler_heap.get(1);
+        // don't need this if we have a single sampler with .ShaderVisible
+        // const sampler_table_start = try shader_visible_sampler_heap.get(1);
         // device.CopyDescriptorsSimple(1, sampler_table_start.cpu_handle, sampler.cpu_handle, .SAMPLER);
 
         cmd_list.SetGraphicsRootDescriptorTable(0, cbv_srv_uav_start.gpu_handle);

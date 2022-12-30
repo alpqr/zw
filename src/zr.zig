@@ -602,12 +602,22 @@ pub const HostVisibleBuffer = struct {
     }
 };
 
-pub const SamplerDescHashContext = struct {
-    pub fn hash(self: @This(), s: d3d12.SAMPLER_DESC) u64 {
+pub const SamplerDescriptorType = enum {
+    Cpu,
+    ShaderVisible
+};
+
+pub const SamplerCacheKey = struct {
+    desc: d3d12.SAMPLER_DESC,
+    stype: SamplerDescriptorType
+};
+
+pub const SamplerCacheHashContext = struct {
+    pub fn hash(self: @This(), s: SamplerCacheKey) u64 {
         _ = self;
         return std.hash.Wyhash.hash(0, std.mem.asBytes(&s));
     }
-    pub fn eql(self: @This(), a: d3d12.SAMPLER_DESC, b: d3d12.SAMPLER_DESC) bool {
+    pub fn eql(self: @This(), a: SamplerCacheKey, b: SamplerCacheKey) bool {
         _ = self;
         return std.meta.eql(a, b);
     }
@@ -807,7 +817,8 @@ pub const Fw = struct {
         camera_wdata: CameraWData,
         mipmapgen_pipeline: ObjectHandle,
         format_work_area: std.ArrayList(u8),
-        sampler_cache_map: std.HashMap(d3d12.SAMPLER_DESC, Descriptor, SamplerDescHashContext, 80),
+        sampler_cache_map: std.HashMap(SamplerCacheKey, Descriptor, SamplerCacheHashContext, 80),
+        sampler_cpu_pool: CpuDescriptorPool,
     };
 
     allocator: std.mem.Allocator,
@@ -1121,7 +1132,9 @@ pub const Fw = struct {
 
         d.format_work_area = std.ArrayList(u8).init(allocator);
 
-        d.sampler_cache_map = std.HashMap(d3d12.SAMPLER_DESC, Descriptor, SamplerDescHashContext, 80).init(allocator);
+        d.sampler_cache_map = std.HashMap(SamplerCacheKey, Descriptor, SamplerCacheHashContext, 80).init(allocator);
+        d.sampler_cpu_pool = try CpuDescriptorPool.init(allocator, device, .SAMPLER);
+        errdefer d.sampler_cpu_pool.deinit();
 
         var self = Fw {
             .allocator = allocator,
@@ -1139,6 +1152,7 @@ pub const Fw = struct {
         for (self.d.swapchain_buffers) |swapchain_buffer| {
             self.d.resource_pool.remove(swapchain_buffer.handle);
         }
+        self.d.sampler_cpu_pool.deinit();
         self.d.sampler_cache_map.deinit();
         self.d.format_work_area.deinit();
         if (self.d.imgui_font_data) |imgui_font_data| {
@@ -2256,14 +2270,15 @@ pub const Fw = struct {
         }
     }
 
-    pub fn lookupOrCreateSampler(self: *Fw, sampler_desc: d3d12.SAMPLER_DESC) !Descriptor {
-        var v = try self.d.sampler_cache_map.getOrPut(sampler_desc);
+    pub fn lookupOrCreateSampler(self: *Fw, key: SamplerCacheKey) !Descriptor {
+        var v = try self.d.sampler_cache_map.getOrPut(key);
         if (v.found_existing) {
             return v.value_ptr.*;
         }
-        const sampler_alloc = try self.getPermanentShaderVisibleSamplerHeapRange().get(1);
-        self.d.device.CreateSampler(&sampler_desc, sampler_alloc.cpu_handle);
-        v.key_ptr.* = sampler_desc;
+        const sampler_alloc = if (key.stype == .Cpu) try self.d.sampler_cpu_pool.allocate(1)
+            else try self.getPermanentShaderVisibleSamplerHeapRange().get(1);
+        self.d.device.CreateSampler(&key.desc, sampler_alloc.cpu_handle);
+        v.key_ptr.* = key;
         v.value_ptr.* = sampler_alloc;
         return sampler_alloc;
     }

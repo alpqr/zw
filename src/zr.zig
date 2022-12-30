@@ -2517,7 +2517,7 @@ pub const Fw = struct {
                     imgui.ImGuiIO_AddKeyEvent(io, imgui.ImGuiMod_Super, isVkKeyDown(w32.VK_APPS));
 
                     var vk = @intCast(i32, wparam);
-                    if (wparam == w32.VK_RETURN and (((lparam >> 16) & 0xffff) & w32.KF_EXTENDED) != 0) {
+                    if (wparam == w32.VK_RETURN and (((lparam >> 16) & 0xFFFF) & w32.KF_EXTENDED) != 0) {
                         vk = w32.IM_VK_KEYPAD_ENTER;
                     }
                     const key = vkKeyToImGuiKey(wparam);

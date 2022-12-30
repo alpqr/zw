@@ -322,6 +322,94 @@ fn create_texture_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     return try fw.lookupOrCreatePipeline(&pso_desc, null, &rs_desc);
 }
 
+fn loadGltf(gltf_path: [:0]const u8) zmesh.gltf.Error!*zmesh.gltf.Data {
+    const options = zmesh.gltf.Options {
+        .memory = .{
+            // .alloc_func = zmesh.mem.zmeshAllocUser,
+            // .free_func = zmesh.mem.zmeshFreeUser,
+        },
+    };
+    const data = try zmesh.gltf.parseFile(options, gltf_path);
+    errdefer zmesh.gltf.free(data);
+    try zmesh.gltf.loadBuffers(options, data, gltf_path);
+    return data;
+}
+
+fn copySubMeshData(
+    data: *zmesh.gltf.Data,
+    mesh_index: u32,
+    submesh_index: u32,
+    indices: *std.ArrayList(u32),
+    positions: *std.ArrayList([3]f32),
+    normals: *std.ArrayList([3]f32),
+    texcoords0: *std.ArrayList([2]f32),
+) !void {
+    std.debug.assert(mesh_index < data.meshes_count);
+    std.debug.assert(submesh_index < data.meshes.?[mesh_index].primitives_count);
+    const mesh = &data.meshes.?[mesh_index];
+    const submesh = &mesh.primitives[submesh_index];
+
+    {
+        const num_indices: u32 = @intCast(u32, submesh.indices.?.count);
+        try indices.ensureTotalCapacity(indices.items.len + num_indices);
+        const accessor = submesh.indices.?;
+        const buffer_view = accessor.buffer_view.?;
+        std.debug.assert(buffer_view.buffer.data != null);
+        const data_addr = @alignCast(4, @ptrCast([*]const u8, buffer_view.buffer.data) + accessor.offset + buffer_view.offset);
+        if (accessor.stride == 1) {
+            std.debug.assert(accessor.component_type == .r_8u);
+            const src = @ptrCast([*]const u8, data_addr);
+            var i: u32 = 0;
+            while (i < num_indices) : (i += 1) {
+                indices.appendAssumeCapacity(src[i]);
+            }
+        } else if (accessor.stride == 2) {
+            std.debug.assert(accessor.component_type == .r_16u);
+            const src = @ptrCast([*]const u16, data_addr);
+            var i: u32 = 0;
+            while (i < num_indices) : (i += 1) {
+                indices.appendAssumeCapacity(src[i]);
+            }
+        } else if (accessor.stride == 4) {
+            std.debug.assert(accessor.component_type == .r_32u);
+            const src = @ptrCast([*]const u32, data_addr);
+            var i: u32 = 0;
+            while (i < num_indices) : (i += 1) {
+                indices.appendAssumeCapacity(src[i]);
+            }
+        }
+    }
+
+    for (submesh.attributes[0..submesh.attributes_count]) |attrib| {
+        const accessor = attrib.data;
+        std.debug.assert(accessor.component_type == .r_32f);
+        const buffer_view = accessor.buffer_view.?;
+        std.debug.assert(buffer_view.buffer.data != null);
+        try positions.ensureTotalCapacity(positions.items.len + accessor.count);
+        try normals.ensureTotalCapacity(normals.items.len + accessor.count);
+        try texcoords0.ensureTotalCapacity(texcoords0.items.len + accessor.count);
+        var offset = accessor.offset + buffer_view.offset;
+        var i: u32 = 0;
+        while (i < accessor.count) : (i += 1) {
+            const data_addr = @ptrCast([*]const u8, buffer_view.buffer.data) + offset;
+            if (attrib.type == .position) {
+                std.debug.assert(accessor.type == .vec3);
+                const d = @ptrCast([*]const [3]f32, @alignCast(4, data_addr));
+                positions.appendAssumeCapacity(d[0]);
+            } else if (attrib.type == .normal) {
+                std.debug.assert(accessor.type == .vec3);
+                const d = @ptrCast([*]const [3]f32, @alignCast(4, data_addr));
+                normals.appendAssumeCapacity(d[0]);
+            } else if (attrib.type == .texcoord) {
+                std.debug.assert(accessor.type == .vec2);
+                const d = @ptrCast([*]const [2]f32, @alignCast(4, data_addr));
+                texcoords0.appendAssumeCapacity(d[0]);
+            }
+            offset += if (buffer_view.stride != 0) buffer_view.stride else accessor.stride;
+        }
+    }
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -342,13 +430,6 @@ pub fn main() !void {
     var vbuf_color = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(VertexWithColor));
     var vbuf_uv = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(VertexWithUv));
     var ibuf = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(u16));
-
-    var torus = zmesh.Shape.initTorus(10, 10, 0.2);
-    defer torus.deinit();
-    const torus_vertex_count = @intCast(u32, torus.positions.len);
-    const torus_index_count = @intCast(u32, torus.indices.len);
-    var vbuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus.positions.len * 3 * @sizeOf(f32)));
-    var ibuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus.indices.len * @sizeOf(u32)));
 
     var needs_upload = true;
     var rotation: f32 = 0.0;
@@ -414,6 +495,112 @@ pub fn main() !void {
     // cpu_handle.ptr += fw.getPermanentShaderVisibleCbvSrvUavHeapRange().descriptor_byte_size;
     // device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
 
+    var gltf = try loadGltf("models/duck/Duck.gltf");
+    defer zmesh.gltf.free(gltf);
+
+    const SubMesh = struct {
+        indices_start_index: u32,
+        vertex_start_index: u32,
+        num_indices: u32,
+        num_vertices: u32,
+        material_index: u32
+    };
+
+    // const MeshVertex = struct {
+    //     position: [3]f32,
+    //     normal: [3]f32,
+    //     texcoords0: [2]f32,
+    // };
+
+    var submeshes = std.ArrayList(SubMesh).init(allocator);
+    defer submeshes.deinit();
+    var mesh_vertices = std.ArrayList([3]f32).init(allocator);
+    defer mesh_vertices.deinit();
+    var mesh_indices = std.ArrayList(u32).init(allocator);
+    defer mesh_indices.deinit();
+
+    {
+        var arena_allocator = std.heap.ArenaAllocator.init(allocator);
+        defer arena_allocator.deinit();
+        const arena = arena_allocator.allocator();
+
+        var indices = std.ArrayList(u32).init(arena);
+        var positions = std.ArrayList([3]f32).init(arena);
+        var normals = std.ArrayList([3]f32).init(arena);
+        var texcoords0 = std.ArrayList([2]f32).init(arena);
+
+        const num_meshes = @intCast(u32, gltf.meshes_count);
+        const num_materials = @intCast(u32, gltf.materials_count);
+
+        var mesh_index: u32 = 0;
+        while (mesh_index < num_meshes) : (mesh_index += 1) {
+            const num_submeshes = @intCast(u32, gltf.meshes.?[mesh_index].primitives_count);
+            var submesh_index: u32 = 0;
+            while (submesh_index < num_submeshes) : (submesh_index += 1) {
+                const indices_start_index = indices.items.len;
+                const positions_start_index = positions.items.len;
+
+                try copySubMeshData(
+                    gltf,
+                    submesh_index,
+                    submesh_index,
+                    &indices,
+                    &positions,
+                    &normals,
+                    &texcoords0
+                );
+
+                var material_index: u32 = 0;
+                var assigned_material_index: u32 = std.math.maxInt(u32);
+                while (material_index < num_materials) : (material_index += 1) {
+                    const submesh = &gltf.meshes.?[mesh_index].primitives[submesh_index];
+                    if (submesh.material == &gltf.materials.?[material_index]) {
+                        assigned_material_index = material_index;
+                        break;
+                    }
+                }
+                if (assigned_material_index == std.math.maxInt(u32)) {
+                    continue;
+                }
+                try submeshes.append(.{
+                    .indices_start_index = @intCast(u32, indices_start_index),
+                    .vertex_start_index = @intCast(u32, positions_start_index),
+                    .num_indices = @intCast(u32, indices.items.len - indices_start_index),
+                    .num_vertices = @intCast(u32, positions.items.len - positions_start_index),
+                    .material_index = assigned_material_index,
+                });
+            }
+        }
+
+        try mesh_indices.ensureTotalCapacity(indices.items.len);
+        for (indices.items) |index| {
+            mesh_indices.appendAssumeCapacity(index);
+        }
+
+        try mesh_vertices.ensureTotalCapacity(positions.items.len);
+        for (positions.items) |_, index| {
+            mesh_vertices.appendAssumeCapacity(positions.items[index]);
+            // .{
+            //     .position = positions.items[index],
+            //     .normal = normals.items[index],
+            //     .texcoords0 = texcoords0.items[index],
+            // });
+        }
+    }
+    std.debug.print("{any}\n", .{submeshes});
+
+    const torus_vertex_count = submeshes.items[0].num_vertices;
+    const torus_index_count = submeshes.items[0].num_indices;
+    var vbuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_vertex_count * 3 * @sizeOf(f32)));
+    var ibuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_index_count * @sizeOf(u32)));
+
+    // var torus = zmesh.Shape.initTorus(10, 10, 0.2);
+    // defer torus.deinit();
+    // const torus_vertex_count = @intCast(u32, torus.positions.len);
+    // const torus_index_count = @intCast(u32, torus.indices.len);
+    // var vbuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_vertex_count * 3 * @sizeOf(f32)));
+    // var ibuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_index_count * @sizeOf(u32)));
+
     var camera = zr.Camera { };
     const GuiState = struct {
         demo_window_open: bool = true,
@@ -458,8 +645,9 @@ pub fn main() !void {
             try fw.uploadBuffer(VertexWithColor, vbuf_color, &vertices_with_color, staging);
             try fw.uploadBuffer(VertexWithUv, vbuf_uv, &vertices_with_uv, staging);
             try fw.uploadBuffer(u16, ibuf, &[_]u16 { 0, 1, 2}, staging);
-            try fw.uploadBuffer([3]f32, vbuf_torus, torus.positions, staging);
-            try fw.uploadBuffer(u32, ibuf_torus, torus.indices, staging);
+
+            try fw.uploadBuffer([3]f32, vbuf_torus, mesh_vertices.items[submeshes.items[0].vertex_start_index..submeshes.items[0].vertex_start_index + submeshes.items[0].num_vertices], staging);
+            try fw.uploadBuffer(u32, ibuf_torus, mesh_indices.items[submeshes.items[0].indices_start_index..submeshes.items[0].indices_start_index + submeshes.items[0].num_indices], staging);
 
             try fw.uploadTexture2DSimple(texture, image.data, image.bytes_per_component * image.num_components, image.bytes_per_row, staging);
 

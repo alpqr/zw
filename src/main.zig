@@ -405,7 +405,9 @@ pub fn main() !void {
         },
         srv.cpu_handle);
 
-    // if we didn't want to build the tables in the shader visible heap on every frame
+    // If we didn't want to build the tables in the shader visible heap on every
+    // frame it could be done once in the permanent area instead.
+    //
     // const cbv_srv_uav_start = fw.getPermanentShaderVisibleCbvSrvUavHeapRange().get(2);
     // var cpu_handle = cbv_srv_uav_start.cpu_handle;
     // device.CopyDescriptorsSimple(1, cpu_handle, cbv2.cpu_handle, .CBV_SRV_UAV);
@@ -472,16 +474,6 @@ pub fn main() !void {
             try fw.generateTexture2DMipmaps(texture);
         }
 
-        var cb_data: CbData = undefined;
-        {
-            const model = zm.mul(zm.rotationY(rotation), zm.translation(-3.0, 0.0, 0.0));
-            const modelview = zm.mul(model, view_matrix);
-            const mvp = zm.mul(modelview, projection);
-            // Mat is stored as row major, transpose to get column major
-            zm.storeMat(&cb_data.mvp, zm.transpose(mvp));
-            std.mem.copy(u8, cbuf_p, std.mem.asBytes(&cb_data));
-        }
-
         const rtv = fw.getBackBufferCpuDescriptorHandle();
         const dsv = fw.getDepthStencilBufferCpuDescriptorHandle();
         cmd_list.OMSetRenderTargets(1, &[_]d3d12.CPU_DESCRIPTOR_HANDLE { rtv }, w32.TRUE, &dsv);
@@ -521,9 +513,19 @@ pub fn main() !void {
             .SizeInBytes = 3 * @sizeOf(u16),
             .Format = .R16_UINT
         });
+        var cb_data: CbData = undefined;
+        {
+            const model = zm.mul(zm.rotationY(rotation), zm.translation(-3.0, 0.0, 0.0));
+            const modelview = zm.mul(model, view_matrix);
+            const mvp = zm.mul(modelview, projection);
+            // Mat is stored as row major, transpose to get column major
+            zm.storeMat(&cb_data.mvp, zm.transpose(mvp));
+            std.mem.copy(u8, cbuf_p, std.mem.asBytes(&cb_data));
+        }
         cmd_list.SetGraphicsRootConstantBufferView(0, resource_pool.lookupRef(cbuf).?.resource.GetGPUVirtualAddress());
         cmd_list.DrawIndexedInstanced(3, 1, 0, 0, 0);
 
+        fw.setPipeline(texture_pipeline);
         {
             const model = zm.mul(zm.rotationY(rotation), zm.translation(3.0, 0.0, 0.0));
             const modelview = zm.mul(model, view_matrix);
@@ -531,9 +533,6 @@ pub fn main() !void {
             zm.storeMat(&cb_data.mvp, zm.transpose(mvp));
             std.mem.copy(u8, cbuf_p[one_cbuf_size..], std.mem.asBytes(&cb_data));
         }
-
-        fw.setPipeline(texture_pipeline);
-
         // param 0: cbv, srv
         // param 1: sampler
         const cbv_srv_uav_start = try shader_visible_cbv_srv_uav_heap.get(2);
@@ -541,14 +540,12 @@ pub fn main() !void {
         device.CopyDescriptorsSimple(1, cpu_handle, cbv2.cpu_handle, .CBV_SRV_UAV);
         cpu_handle.ptr += shader_visible_cbv_srv_uav_heap.descriptor_byte_size;
         device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
-        // don't need this if we have a single sampler with .ShaderVisible
+        // don't need this if we have just a single sampler with .ShaderVisible
         // const sampler_table_start = try shader_visible_sampler_heap.get(1);
         // device.CopyDescriptorsSimple(1, sampler_table_start.cpu_handle, sampler.cpu_handle, .SAMPLER);
-
         cmd_list.SetGraphicsRootDescriptorTable(0, cbv_srv_uav_start.gpu_handle);
         //cmd_list.SetGraphicsRootDescriptorTable(1, sampler_table_start.gpu_handle);
         cmd_list.SetGraphicsRootDescriptorTable(1, sampler.gpu_handle);
-
         cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
             .{
                 .BufferLocation = resource_pool.lookupRef(vbuf_uv).?.resource.GetGPUVirtualAddress(),
@@ -559,7 +556,6 @@ pub fn main() !void {
         cmd_list.DrawIndexedInstanced(3, 1, 0, 0, 0);
 
         fw.setPipeline(simple_pipeline);
-        cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
         cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
             .{
                 .BufferLocation = resource_pool.lookupRef(vbuf_torus).?.resource.GetGPUVirtualAddress(),

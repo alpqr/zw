@@ -325,6 +325,15 @@ pub fn main() !void {
         },
         srv.cpu_handle);
 
+    // const cbv_srv_uav_start = fw.getPermanentShaderVisibleCbvSrvUavHeapRange().get(2);
+    // var cpu_handle = cbv_srv_uav_start.cpu_handle;
+    // device.CopyDescriptorsSimple(1, cpu_handle, cbv2.cpu_handle, .CBV_SRV_UAV);
+    // cpu_handle.ptr += fw.getPermanentShaderVisibleCbvSrvUavHeapRange().descriptor_byte_size;
+    // device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
+
+    // const sampler_table_start = fw.getPermanentShaderVisibleSamplerHeapRange().get(1);
+    // device.CopyDescriptorsSimple(1, sampler_table_start.cpu_handle, sampler.cpu_handle, .SAMPLER);
+
     var camera = zr.Camera { };
     const GuiState = struct {
         rotate: bool = true
@@ -342,7 +351,7 @@ pub fn main() !void {
         const output_pixel_size = fw.getBackBufferPixelSize();
         const cmd_list = fw.getCommandList();
         // 'current' = per-frame, their start ptr is reset to zero in beginFrame()
-        const staging = fw.getCurrentSmallStagingArea();
+        const staging = fw.getCurrentStagingArea();
         const shader_visible_cbv_srv_uav_heap = fw.getCurrentShaderVisibleCbvSrvUavHeapRange();
         const shader_visible_sampler_heap = fw.getCurrentShaderVisibleSamplerHeapRange();
 
@@ -439,6 +448,11 @@ pub fn main() !void {
         }
 
         fw.setPipeline(texture_pipeline);
+        cmd_list.SetDescriptorHeaps(2, &[_]*d3d12.IDescriptorHeap {
+            fw.getShaderVisibleCbvSrvUavHeap(),
+            fw.getShaderVisibleSamplerHeap()
+        });
+
         // param 0: cbv, srv
         // param 1: sampler
         const cbv_srv_uav_start = shader_visible_cbv_srv_uav_heap.get(2);
@@ -448,12 +462,10 @@ pub fn main() !void {
         device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
         const sampler_table_start = shader_visible_sampler_heap.get(1);
         device.CopyDescriptorsSimple(1, sampler_table_start.cpu_handle, sampler.cpu_handle, .SAMPLER);
-        cmd_list.SetDescriptorHeaps(2, &[_]*d3d12.IDescriptorHeap {
-            fw.getShaderVisibleCbvSrvUavHeap(),
-            fw.getShaderVisibleSamplerHeap()
-        });
+
         cmd_list.SetGraphicsRootDescriptorTable(0, cbv_srv_uav_start.gpu_handle);
         cmd_list.SetGraphicsRootDescriptorTable(1, sampler_table_start.gpu_handle);
+
         cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
             .{
                 .BufferLocation = resource_pool.lookupRef(vbuf_uv).?.resource.GetGPUVirtualAddress(),

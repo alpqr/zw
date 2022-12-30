@@ -128,6 +128,10 @@ pub const DescriptorHeap = struct {
     pub fn reset(self: *DescriptorHeap) void {
         self.size = 0;
     }
+
+    pub fn remainingCapacity(self: *const DescriptorHeap) u32 {
+        return self.capacity - self.size;
+    }
 };
 
 pub const CpuDescriptorPool = struct {
@@ -684,9 +688,11 @@ pub const Fw = struct {
         window_name: [*:0]const u8 = "zigapp",
         enable_debug_layer: bool = false,
         swap_interval: u32 = 1,
-        small_staging_area_capacity_per_frame: u32 = 16 * 1024 * 1024,
-        shader_visible_cbv_srv_uav_heap_capacity_per_frame: u32 = 1024,
-        shader_visible_sampler_heap_capacity_per_frame: u32 = 64,
+        staging_area_capacity_per_frame: u32 = 16 * 1024 * 1024,
+        shader_visible_permanent_cbv_srv_uav_heap_range_capacity: u32 = 256,
+        shader_visible_per_frame_cbv_srv_uav_heap_range_capacity: u32 = 1024,
+        shader_visible_permanent_sampler_heap_range_capacity: u32 = 16,
+        shader_visible_per_frame_sampler_heap_range_capacity: u32 = 64,
     };
 
     pub const max_frames_in_flight = 2;
@@ -712,7 +718,10 @@ pub const Fw = struct {
         };
         handle: ObjectHandle,
         rtype: Type,
-        frame_slot_to_be_released_in: ?u32
+        frame_slot_to_be_released_in: ?u32,
+        view_pool: ?*CpuDescriptorPool,
+        view_start: ?Descriptor,
+        view_count: ?u32
     };
 
     const ImguiWData = struct {
@@ -761,11 +770,13 @@ pub const Fw = struct {
         release_queue: std.ArrayList(DeferredReleaseEntry),
         transition_resource_barriers: []TransitionResourceBarrier,
         trb_next: u32,
-        small_staging_areas: [max_frames_in_flight]StagingArea,
+        staging_areas: [max_frames_in_flight]StagingArea,
         shader_visible_cbv_srv_uav_heap: DescriptorHeap,
-        shader_visible_cbv_srv_uav_heap_ranges: [max_frames_in_flight]DescriptorHeap,
+        shader_visible_permanent_cbv_srv_uav_heap_range: DescriptorHeap,
+        shader_visible_per_frame_cbv_srv_uav_heap_ranges: [max_frames_in_flight]DescriptorHeap,
         shader_visible_sampler_heap: DescriptorHeap,
-        shader_visible_sampler_heap_ranges: [max_frames_in_flight]DescriptorHeap,
+        shader_visible_permanent_sampler_heap_range: DescriptorHeap,
+        shader_visible_per_frame_sampler_heap_ranges: [max_frames_in_flight]DescriptorHeap,
         depth_stencil_buffer: ObjectHandle,
         dsv: Descriptor,
         current_pipeline_handle: ObjectHandle,
@@ -1018,36 +1029,58 @@ pub const Fw = struct {
         errdefer allocator.free(d.transition_resource_barriers);
         d.trb_next = 0;
 
-        for (d.small_staging_areas) |_, index| {
-            d.small_staging_areas[index] = try StagingArea.init(d.device,
-                                                                d.options.small_staging_area_capacity_per_frame,
-                                                                .UPLOAD);
+        for (d.staging_areas) |_, index| {
+            d.staging_areas[index] = try StagingArea.init(d.device,
+                                                          d.options.staging_area_capacity_per_frame,
+                                                          .UPLOAD);
         }
 
-        var heap_capacity = d.options.shader_visible_cbv_srv_uav_heap_capacity_per_frame;
+        var gpu_heap_total_capacity =
+            d.options.shader_visible_permanent_cbv_srv_uav_heap_range_capacity
+            + max_frames_in_flight * d.options.shader_visible_per_frame_cbv_srv_uav_heap_range_capacity;
         d.shader_visible_cbv_srv_uav_heap = try DescriptorHeap.init(d.device,
-                                                                   max_frames_in_flight * heap_capacity,
-                                                                   .CBV_SRV_UAV,
-                                                                   d3d12.DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+                                                                    gpu_heap_total_capacity,
+                                                                    .CBV_SRV_UAV,
+                                                                    d3d12.DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
         errdefer d.shader_visible_cbv_srv_uav_heap.deinit();
-        for (d.shader_visible_cbv_srv_uav_heap_ranges) |_, index| {
-            d.shader_visible_cbv_srv_uav_heap_ranges[index] = DescriptorHeap.initWithExisting(
+
+        d.shader_visible_permanent_cbv_srv_uav_heap_range = DescriptorHeap.initWithExisting(
+            d.shader_visible_cbv_srv_uav_heap,
+            0,
+            d.options.shader_visible_permanent_cbv_srv_uav_heap_range_capacity);
+
+        var heap_range_offset = d.options.shader_visible_permanent_cbv_srv_uav_heap_range_capacity;
+        var heap_range_size = d.options.shader_visible_per_frame_cbv_srv_uav_heap_range_capacity;
+        for (d.shader_visible_per_frame_cbv_srv_uav_heap_ranges) |_, index| {
+            d.shader_visible_per_frame_cbv_srv_uav_heap_ranges[index] = DescriptorHeap.initWithExisting(
                 d.shader_visible_cbv_srv_uav_heap,
-                @intCast(u32, index * heap_capacity),
-                heap_capacity);
+                heap_range_offset,
+                heap_range_size);
+            heap_range_offset += heap_range_size;
         }
 
-        heap_capacity = d.options.shader_visible_sampler_heap_capacity_per_frame;
+        gpu_heap_total_capacity =
+            d.options.shader_visible_permanent_sampler_heap_range_capacity
+            + max_frames_in_flight * d.options.shader_visible_per_frame_sampler_heap_range_capacity;
         d.shader_visible_sampler_heap = try DescriptorHeap.init(d.device,
-                                                                max_frames_in_flight * heap_capacity,
+                                                                gpu_heap_total_capacity,
                                                                 .SAMPLER,
                                                                 d3d12.DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
         errdefer d.shader_visible_sampler_heap.deinit();
-        for (d.shader_visible_sampler_heap_ranges) |_, index| {
-            d.shader_visible_sampler_heap_ranges[index] = DescriptorHeap.initWithExisting(
+
+        d.shader_visible_permanent_sampler_heap_range = DescriptorHeap.initWithExisting(
+            d.shader_visible_sampler_heap,
+            0,
+            d.options.shader_visible_permanent_sampler_heap_range_capacity);
+
+        heap_range_offset = d.options.shader_visible_permanent_sampler_heap_range_capacity;
+        heap_range_size = d.options.shader_visible_per_frame_sampler_heap_range_capacity;
+        for (d.shader_visible_per_frame_sampler_heap_ranges) |_, index| {
+            d.shader_visible_per_frame_sampler_heap_ranges[index] = DescriptorHeap.initWithExisting(
                 d.shader_visible_sampler_heap,
-                @intCast(u32, index * heap_capacity),
-                heap_capacity);
+                heap_range_offset,
+                heap_range_size);
+            heap_range_offset += heap_range_size;
         }
 
         d.current_frame_slot = 0;
@@ -1088,14 +1121,8 @@ pub const Fw = struct {
             self.allocator.free(imgui_font_data);
         }
         self.d.shader_visible_sampler_heap.deinit();
-        for (self.d.shader_visible_sampler_heap_ranges) |*h| {
-            h.deinit();
-        }
         self.d.shader_visible_cbv_srv_uav_heap.deinit();
-        for (self.d.shader_visible_cbv_srv_uav_heap_ranges) |*h| {
-            h.deinit();
-        }
-        for (self.d.small_staging_areas) |*staging_area| {
+        for (self.d.staging_areas) |*staging_area| {
             staging_area.deinit();
         }
         self.allocator.free(self.d.transition_resource_barriers);
@@ -1295,24 +1322,32 @@ pub const Fw = struct {
         return self.d.current_frame_slot;
     }
 
-    pub fn getCurrentSmallStagingArea(self: *const Fw) *StagingArea {
-        return &self.d.small_staging_areas[self.d.current_frame_slot];
+    pub fn getCurrentStagingArea(self: *const Fw) *StagingArea {
+        return &self.d.staging_areas[self.d.current_frame_slot];
     }
 
     pub fn getShaderVisibleCbvSrvUavHeap(self: *const Fw) *d3d12.IDescriptorHeap {
         return self.d.shader_visible_cbv_srv_uav_heap.heap.?;
     }
 
+    pub fn getPermanentShaderVisibleCbvSrvUavHeapRange(self: *const Fw) *DescriptorHeap {
+        return &self.d.shader_visible_permanent_cbv_srv_uav_heap_range;
+    }
+
     pub fn getCurrentShaderVisibleCbvSrvUavHeapRange(self: *const Fw) *DescriptorHeap {
-        return &self.d.shader_visible_cbv_srv_uav_heap_ranges[self.d.current_frame_slot];
+        return &self.d.shader_visible_per_frame_cbv_srv_uav_heap_ranges[self.d.current_frame_slot];
     }
 
     pub fn getShaderVisibleSamplerHeap(self: *const Fw) *d3d12.IDescriptorHeap {
         return self.d.shader_visible_sampler_heap.heap.?;
     }
 
+    pub fn getPermanentShaderVisibleSamplerHeapRange(self: *const Fw) *DescriptorHeap {
+        return &self.d.shader_visible_permanent_sampler_heap_range;
+    }
+
     pub fn getCurrentShaderVisibleSamplerHeapRange(self: *const Fw) *DescriptorHeap {
-        return &self.d.shader_visible_sampler_heap_ranges[self.d.current_frame_slot];
+        return &self.d.shader_visible_per_frame_sampler_heap_ranges[self.d.current_frame_slot];
     }
 
     pub fn getDepthStencilBufferCpuDescriptorHandle(self: *const Fw) d3d12.CPU_DESCRIPTOR_HANDLE {
@@ -1370,9 +1405,9 @@ pub const Fw = struct {
 
         self.resetTrackedState();
 
-        self.d.small_staging_areas[self.d.current_frame_slot].reset();
-        self.d.shader_visible_cbv_srv_uav_heap_ranges[self.d.current_frame_slot].reset();
-        self.d.shader_visible_sampler_heap_ranges[self.d.current_frame_slot].reset();
+        self.d.staging_areas[self.d.current_frame_slot].reset();
+        self.d.shader_visible_per_frame_cbv_srv_uav_heap_ranges[self.d.current_frame_slot].reset();
+        self.d.shader_visible_per_frame_sampler_heap_ranges[self.d.current_frame_slot].reset();
 
         return BeginFrameResult.success;
     }
@@ -1424,7 +1459,25 @@ pub const Fw = struct {
         self.d.release_queue.append(.{
             .handle = resource_handle,
             .rtype = .Resource,
-            .frame_slot_to_be_released_in = null
+            .frame_slot_to_be_released_in = null,
+            .view_pool = null,
+            .view_start = null,
+            .view_count = null
+        }) catch { };
+    }
+
+    pub fn deferredReleaseResourceWithViews(self: *Fw,
+                                            resource_handle: ObjectHandle,
+                                            view_pool: *CpuDescriptorPool,
+                                            view: Descriptor,
+                                            view_count: u32) void {
+        self.d.release_queue.append(.{
+            .handle = resource_handle,
+            .rtype = .Resource,
+            .frame_slot_to_be_released_in = null,
+            .view_pool = view_pool,
+            .view_start = view,
+            .view_count = view_count
         }) catch { };
     }
 
@@ -1456,6 +1509,9 @@ pub const Fw = struct {
             if (self.d.release_queue.items[idx].frame_slot_to_be_released_in) |f| {
                 if (f == self.d.current_frame_slot) {
                     const e = self.d.release_queue.orderedRemove(idx);
+                    if (e.view_pool != null and e.view_start != null and e.view_count != null) {
+                        e.view_pool.?.release(e.view_start.?, e.view_count.?);
+                    }
                     switch (e.rtype) {
                         .Resource => {
                             self.d.resource_pool.remove(e.handle);
@@ -1825,7 +1881,7 @@ pub const Fw = struct {
                     .texel_height = 1.0 / @intToFloat(f32, level_plus_one_mip_height)
                 }
             };
-            const cbuf = try self.getCurrentSmallStagingArea().allocate(@sizeOf(CBufData));
+            const cbuf = try self.getCurrentStagingArea().allocate(@sizeOf(CBufData));
             std.mem.copy(CBufData, cbuf.castCpuSlice(CBufData), &cbuf_data);
             self.d.cmd_list.SetComputeRootConstantBufferView(0, cbuf.gpu_addr);
 
@@ -1934,7 +1990,7 @@ pub const Fw = struct {
             const pixels = p[0..@intCast(usize, w * h * 4)];
             self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_COPY_DEST);
             self.recordTransitionBarriers();
-            try self.uploadTexture2DSimple(texture, pixels, 4, @intCast(u32, w * 4), self.getCurrentSmallStagingArea());
+            try self.uploadTexture2DSimple(texture, pixels, 4, @intCast(u32, w * 4), self.getCurrentStagingArea());
             self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             self.recordTransitionBarriers();
 
@@ -2141,7 +2197,7 @@ pub const Fw = struct {
         self.d.cmd_list.SetDescriptorHeaps(1, &[_]*d3d12.IDescriptorHeap {
             self.getShaderVisibleCbvSrvUavHeap()
         });
-        const cbuf = try self.getCurrentSmallStagingArea().allocate(64);
+        const cbuf = try self.getCurrentStagingArea().allocate(64);
         const m = [_]f32 { // column major
             2.0 / @intToFloat(f32, self.d.swapchain_size.width), 0.0, 0.0, -1.0,
             0.0, 2.0 / -@intToFloat(f32, self.d.swapchain_size.height), 0.0, 1.0,

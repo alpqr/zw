@@ -5,8 +5,9 @@ const dxgi = zwin32.dxgi;
 const d3d = zwin32.d3d;
 const d3d12 = zwin32.d3d12;
 const d3d12d = zwin32.d3d12d;
-const zm = @import("zmath");
-const zstbi = @import("zstbi");
+pub const zm = @import("zmath");
+pub const zstbi = @import("zstbi");
+pub const zmesh = @import("zmesh");
 pub const imgui = @cImport({
     @cDefine("CIMGUI_DEFINE_ENUMS_AND_STRUCTS", "");
     @cDefine("CIMGUI_NO_EXPORT", "");
@@ -815,6 +816,9 @@ pub const Fw = struct {
         zstbi.init(allocator);
         errdefer zstbi.deinit();
 
+        zmesh.init(allocator);
+        errdefer zmesh.deinit();
+
         _ = imgui.igCreateContext(null);
         errdefer imgui.igDestroyContext(null);
         var io = imgui.igGetIO().?;
@@ -1143,6 +1147,7 @@ pub const Fw = struct {
         _ = self.d.device.Release();
         _ = self.d.dxgiFactory.Release();
         imgui.igDestroyContext(null);
+        zmesh.deinit();
         zstbi.deinit();
         self.allocator.destroy(self.d);
         w32.ole32.CoUninitialize();

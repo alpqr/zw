@@ -3,9 +3,10 @@ const zwin32 = @import("zwin32");
 const w32 = zwin32.base;
 const d3d = zwin32.d3d;
 const d3d12 = zwin32.d3d12;
-const zm = @import("zmath");
-const zstbi = @import("zstbi");
 const zr = @import("zr.zig");
+const zm = zr.zm;
+const zstbi = zr.zstbi;
+const zmesh = zr.zmesh;
 const imgui = zr.imgui;
 
 const color_vs = @embedFile("shaders/color.vs.cso");

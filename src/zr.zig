@@ -99,8 +99,13 @@ pub const DescriptorHeap = struct {
         }
     }
 
-    pub fn get(self: *DescriptorHeap, count: u32) Descriptor {
-        std.debug.assert(self.size + count <= self.capacity);
+    pub fn get(self: *DescriptorHeap, count: u32) !Descriptor {
+        std.debug.assert(count > 0);
+        if (self.size + count > self.capacity) {
+            std.debug.print("Cannot get {} descriptors as that would exceed capacity {}\n",
+                            .{ count, self.capacity });
+            return error.DescriptorHeapOverflow;
+        }
         self.size += count;
         return self.at(self.size - count);
     }
@@ -597,6 +602,17 @@ pub const HostVisibleBuffer = struct {
     }
 };
 
+pub const SamplerDescHashContext = struct {
+    pub fn hash(self: @This(), s: d3d12.SAMPLER_DESC) u64 {
+        _ = self;
+        return std.hash.Wyhash.hash(0, std.mem.asBytes(&s));
+    }
+    pub fn eql(self: @This(), a: d3d12.SAMPLER_DESC, b: d3d12.SAMPLER_DESC) bool {
+        _ = self;
+        return std.meta.eql(a, b);
+    }
+};
+
 pub const Size = struct {
     width: u32,
     height: u32,
@@ -791,6 +807,7 @@ pub const Fw = struct {
         camera_wdata: CameraWData,
         mipmapgen_pipeline: ObjectHandle,
         format_work_area: std.ArrayList(u8),
+        sampler_cache_map: std.HashMap(d3d12.SAMPLER_DESC, Descriptor, SamplerDescHashContext, 80),
     };
 
     allocator: std.mem.Allocator,
@@ -1104,6 +1121,8 @@ pub const Fw = struct {
 
         d.format_work_area = std.ArrayList(u8).init(allocator);
 
+        d.sampler_cache_map = std.HashMap(d3d12.SAMPLER_DESC, Descriptor, SamplerDescHashContext, 80).init(allocator);
+
         var self = Fw {
             .allocator = allocator,
             .d = d
@@ -1120,6 +1139,7 @@ pub const Fw = struct {
         for (self.d.swapchain_buffers) |swapchain_buffer| {
             self.d.resource_pool.remove(swapchain_buffer.handle);
         }
+        self.d.sampler_cache_map.deinit();
         self.d.format_work_area.deinit();
         if (self.d.imgui_font_data) |imgui_font_data| {
             self.allocator.free(imgui_font_data);
@@ -1881,7 +1901,7 @@ pub const Fw = struct {
             std.mem.copy(CBufData, cbuf.castCpuSlice(CBufData), &cbuf_data);
             self.d.cmd_list.SetComputeRootConstantBufferView(0, cbuf.gpu_addr);
 
-            const srv = self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(1);
+            const srv = try self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(1);
             self.d.device.CreateShaderResourceView(
                 texture_res.resource, &.{
                     .Format = texture_res.desc.Format,
@@ -1899,7 +1919,7 @@ pub const Fw = struct {
                 srv.cpu_handle);
             self.d.cmd_list.SetComputeRootDescriptorTable(1, srv.gpu_handle);
 
-            const uav_table_start = self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(4);
+            const uav_table_start = try self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(4);
             var uav_cpu_handle = uav_table_start.cpu_handle;
             // if level is N, then need UAVs for levels N+1, ..., N+4
             var uav_idx: u32 = 0;
@@ -2202,7 +2222,7 @@ pub const Fw = struct {
         };
         std.mem.copy(f32, cbuf.castCpuSlice(f32), &m);
         self.d.cmd_list.SetGraphicsRootConstantBufferView(0, cbuf.gpu_addr);
-        const shader_visible_srv = self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(1);
+        const shader_visible_srv = try self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(1);
         self.d.device.CopyDescriptorsSimple(1,
                                             shader_visible_srv.cpu_handle,
                                             self.d.imgui_font_srv.cpu_handle,
@@ -2234,6 +2254,18 @@ pub const Fw = struct {
             voffset += @intCast(u32, gui_cmd_list.*.VtxBuffer.Size);
             ioffset += @intCast(u32, gui_cmd_list.*.IdxBuffer.Size);
         }
+    }
+
+    pub fn lookupOrCreateSampler(self: *Fw, sampler_desc: d3d12.SAMPLER_DESC) !Descriptor {
+        var v = try self.d.sampler_cache_map.getOrPut(sampler_desc);
+        if (v.found_existing) {
+            return v.value_ptr.*;
+        }
+        const sampler_alloc = try self.getPermanentShaderVisibleSamplerHeapRange().get(1);
+        self.d.device.CreateSampler(&sampler_desc, sampler_alloc.cpu_handle);
+        v.key_ptr.* = sampler_desc;
+        v.value_ptr.* = sampler_alloc;
+        return sampler_alloc;
     }
 
     fn isVkKeyDown(vk: c_int) bool {

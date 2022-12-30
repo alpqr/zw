@@ -374,19 +374,14 @@ pub fn main() !void {
         },
         cbv2.cpu_handle);
 
-    // No static samplers, make it more difficult.
-    var sampler_pool = try zr.CpuDescriptorPool.init(allocator,
-                                                     device,
-                                                     .SAMPLER);
-    defer sampler_pool.deinit();
-    var sampler = try sampler_pool.allocate(1);
+    // No static sampler here, but exercise the helper so no need for a SAMPLER CpuDescriptorPool.
     var sampler_desc = std.mem.zeroes(d3d12.SAMPLER_DESC);
     sampler_desc.Filter = .MIN_MAG_MIP_LINEAR;
     sampler_desc.AddressU = .CLAMP;
     sampler_desc.AddressV = .CLAMP;
     sampler_desc.AddressW = .CLAMP;
     sampler_desc.MaxLOD = std.math.floatMax(f32); // mipmapping
-    device.CreateSampler(&sampler_desc, sampler.cpu_handle);
+    const sampler = try fw.lookupOrCreateSampler(sampler_desc);
 
     var image = try zstbi.Image.init("maps/test.png", 4);
     defer image.deinit();
@@ -416,9 +411,6 @@ pub fn main() !void {
     // cpu_handle.ptr += fw.getPermanentShaderVisibleCbvSrvUavHeapRange().descriptor_byte_size;
     // device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
 
-    // const sampler_table_start = fw.getPermanentShaderVisibleSamplerHeapRange().get(1);
-    // device.CopyDescriptorsSimple(1, sampler_table_start.cpu_handle, sampler.cpu_handle, .SAMPLER);
-
     var camera = zr.Camera { };
     const GuiState = struct {
         rotate: bool = true
@@ -438,7 +430,7 @@ pub fn main() !void {
         // 'current' = per-frame, their start ptr is reset to zero in beginFrame()
         const staging = fw.getCurrentStagingArea();
         const shader_visible_cbv_srv_uav_heap = fw.getCurrentShaderVisibleCbvSrvUavHeapRange();
-        const shader_visible_sampler_heap = fw.getCurrentShaderVisibleSamplerHeapRange();
+        //const shader_visible_sampler_heap = fw.getCurrentShaderVisibleSamplerHeapRange();
 
         if (!std.meta.eql(output_pixel_size, last_size_used_for_projection)) {
             last_size_used_for_projection = output_pixel_size;
@@ -545,16 +537,17 @@ pub fn main() !void {
 
         // param 0: cbv, srv
         // param 1: sampler
-        const cbv_srv_uav_start = shader_visible_cbv_srv_uav_heap.get(2);
+        const cbv_srv_uav_start = try shader_visible_cbv_srv_uav_heap.get(2);
         var cpu_handle = cbv_srv_uav_start.cpu_handle;
         device.CopyDescriptorsSimple(1, cpu_handle, cbv2.cpu_handle, .CBV_SRV_UAV);
         cpu_handle.ptr += shader_visible_cbv_srv_uav_heap.descriptor_byte_size;
         device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
-        const sampler_table_start = shader_visible_sampler_heap.get(1);
-        device.CopyDescriptorsSimple(1, sampler_table_start.cpu_handle, sampler.cpu_handle, .SAMPLER);
+        // const sampler_table_start = shader_visible_sampler_heap.get(1);
+        // device.CopyDescriptorsSimple(1, sampler_table_start.cpu_handle, sampler.cpu_handle, .SAMPLER);
 
         cmd_list.SetGraphicsRootDescriptorTable(0, cbv_srv_uav_start.gpu_handle);
-        cmd_list.SetGraphicsRootDescriptorTable(1, sampler_table_start.gpu_handle);
+        //cmd_list.SetGraphicsRootDescriptorTable(1, sampler_table_start.gpu_handle);
+        cmd_list.SetGraphicsRootDescriptorTable(1, sampler.gpu_handle);
 
         cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
             .{
@@ -580,16 +573,16 @@ pub fn main() !void {
             .Format = .R32_UINT
         });
         var torus_cb_data: SimpleCbData = undefined;
+        const torus_cb_alloc = try staging.allocate(@sizeOf(SimpleCbData));
         {
-            const model = zm.mul(zm.rotationY(rotation), zm.translation(0.0, 0.0, 0.0));
+            const model = zm.mul(zm.rotationY(-rotation), zm.translation(0.0, 0.0, 0.0));
             const modelview = zm.mul(model, view_matrix);
             const mvp = zm.mul(modelview, projection);
             zm.storeMat(&torus_cb_data.mvp, zm.transpose(mvp));
-            torus_cb_data.color = [4]f32 { 1.0, 1.0, 1.0, 1.0 };
-            const torus_cb_alloc = try staging.allocate(@sizeOf(SimpleCbData));
+            torus_cb_data.color = [4]f32 { 0.0, 1.0, 1.0, 1.0 };
             std.mem.copy(SimpleCbData, torus_cb_alloc.castCpuSlice(SimpleCbData), &[_]SimpleCbData { torus_cb_data });
-            cmd_list.SetGraphicsRootConstantBufferView(0, torus_cb_alloc.gpu_addr);
         }
+        cmd_list.SetGraphicsRootConstantBufferView(0, torus_cb_alloc.gpu_addr);
         cmd_list.DrawIndexedInstanced(torus_index_count, 1, 0, 0, 0);
 
         try fw.beginGui(&cbv_srv_uav_pool);

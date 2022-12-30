@@ -413,6 +413,8 @@ pub fn main() !void {
 
     var camera = zr.Camera { };
     const GuiState = struct {
+        demo_window_open: bool = true,
+        window_open: bool = true,
         rotate: bool = true
     };
     var gui_state = GuiState { };
@@ -586,15 +588,17 @@ pub fn main() !void {
         cmd_list.DrawIndexedInstanced(torus_index_count, 1, 0, 0, 0);
 
         try fw.beginGui(&cbv_srv_uav_pool);
-        var demoWindowOpen: bool = true;
-        imgui.igShowDemoWindow(&demoWindowOpen);
-        imgui.igSetNextWindowPos(imgui.ImVec2 { .x = 0, .y = 0 }, imgui.ImGuiCond_FirstUseEver, imgui.ImVec2 { .x = 0, .y = 0 });
-        imgui.igSetNextWindowSize(imgui.ImVec2 { .x = 650, .y = 120 }, imgui.ImGuiCond_FirstUseEver);
-        var windowOpen: bool = true;
-        if (imgui.igBegin("Test", &windowOpen, imgui.ImGuiWindowFlags_None)) {
-            imgui.igText("Mouse + WASDRF to move the camera (when no ImGui window is focused)");
-            _ = imgui.igCheckbox("Rotate", &gui_state.rotate);
-            _ = imgui.igText(fw.formatTempZ("Test formatting {} {s}", .{123, "abcd"}).ptr);
+        if (gui_state.demo_window_open) {
+            imgui.igShowDemoWindow(&gui_state.demo_window_open);
+        }
+        if (gui_state.window_open) {
+            imgui.igSetNextWindowPos(imgui.ImVec2 { .x = 0, .y = 0 }, imgui.ImGuiCond_FirstUseEver, imgui.ImVec2 { .x = 0, .y = 0 });
+            imgui.igSetNextWindowSize(imgui.ImVec2 { .x = 650, .y = 120 }, imgui.ImGuiCond_FirstUseEver);
+            if (imgui.igBegin("Test", &gui_state.window_open, imgui.ImGuiWindowFlags_None)) {
+                imgui.igText("Mouse + WASDRF to move the camera (when no ImGui window is focused)");
+                _ = imgui.igCheckbox("Rotate", &gui_state.rotate);
+                _ = imgui.igText(fw.formatTempZ("Test formatting {} {s}", .{123, "abcd"}).ptr);
+            }
             imgui.igEnd();
         }
         try fw.endGui();

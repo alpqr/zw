@@ -405,6 +405,7 @@ pub fn main() !void {
         },
         srv.cpu_handle);
 
+    // if we didn't want to build the tables in the shader visible heap on every frame
     // const cbv_srv_uav_start = fw.getPermanentShaderVisibleCbvSrvUavHeapRange().get(2);
     // var cpu_handle = cbv_srv_uav_start.cpu_handle;
     // device.CopyDescriptorsSimple(1, cpu_handle, cbv2.cpu_handle, .CBV_SRV_UAV);
@@ -532,10 +533,6 @@ pub fn main() !void {
         }
 
         fw.setPipeline(texture_pipeline);
-        cmd_list.SetDescriptorHeaps(2, &[_]*d3d12.IDescriptorHeap {
-            fw.getShaderVisibleCbvSrvUavHeap(),
-            fw.getShaderVisibleSamplerHeap()
-        });
 
         // param 0: cbv, srv
         // param 1: sampler

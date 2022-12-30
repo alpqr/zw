@@ -1452,6 +1452,11 @@ pub const Fw = struct {
         try zwin32.hrErrorOnFail(cmd_allocator.Reset());
         try zwin32.hrErrorOnFail(self.d.cmd_list.Reset(cmd_allocator, null));
 
+        self.d.cmd_list.SetDescriptorHeaps(2, &[_]*d3d12.IDescriptorHeap {
+            self.getShaderVisibleCbvSrvUavHeap(),
+            self.getShaderVisibleSamplerHeap()
+        });
+
         self.addTransitionBarrier(self.getBackBufferObjectHandle(), d3d12.RESOURCE_STATE_RENDER_TARGET);
         self.recordTransitionBarriers();
 
@@ -1868,9 +1873,6 @@ pub const Fw = struct {
         }
 
         self.setPipeline(self.d.mipmapgen_pipeline);
-        self.d.cmd_list.SetDescriptorHeaps(1, &[_]*d3d12.IDescriptorHeap {
-            self.getShaderVisibleCbvSrvUavHeap()
-        });
 
         self.recordUavBarrier(texture);
         self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2224,9 +2226,6 @@ pub const Fw = struct {
             .Format = if (@sizeOf(imgui.ImDrawIdx) == 2) .R16_UINT else .R32_UINT
         });
 
-        self.d.cmd_list.SetDescriptorHeaps(1, &[_]*d3d12.IDescriptorHeap {
-            self.getShaderVisibleCbvSrvUavHeap()
-        });
         const cbuf = try self.getCurrentStagingArea().allocate(64);
         const m = [_]f32 { // column major
             2.0 / @intToFloat(f32, self.d.swapchain_size.width), 0.0, 0.0, -1.0,

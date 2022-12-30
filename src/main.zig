@@ -539,7 +539,7 @@ pub fn main() !void {
 
                 try copySubMeshData(
                     gltf,
-                    submesh_index,
+                    mesh_index,
                     submesh_index,
                     &indices,
                     &positions,

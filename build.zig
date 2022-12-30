@@ -62,6 +62,24 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
     const dxc_step = b.step("dxc", "Build shaders");
 
     var dxc_command = makeDxcCmd(
+        "simple.hlsl",
+        "vsMain",
+        "simple.vs.cso",
+        "vs",
+        ""
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "simple.hlsl",
+        "psMain",
+        "simple.ps.cso",
+        "ps",
+        ""
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
         "color.hlsl",
         "vsMain",
         "color.vs.cso",

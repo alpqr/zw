@@ -9,6 +9,8 @@ const zstbi = zr.zstbi;
 const zmesh = zr.zmesh;
 const imgui = zr.imgui;
 
+const simple_vs = @embedFile("shaders/simple.vs.cso");
+const simple_ps = @embedFile("shaders/simple.ps.cso");
 const color_vs = @embedFile("shaders/color.vs.cso");
 const color_ps = @embedFile("shaders/color.ps.cso");
 const texture_vs = @embedFile("shaders/texture.vs.cso");
@@ -55,6 +57,78 @@ const vertices_with_uv = [_]VertexWithUv {
         .uv = [2]f32 { 0.5, 0 }
     }
 };
+
+const SimpleCbData = struct {
+    mvp: [16]f32,
+    color: [4]f32
+};
+comptime { std.debug.assert(@sizeOf(SimpleCbData) == 80); }
+
+fn create_simple_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
+    const input_element_descs = [_]d3d12.INPUT_ELEMENT_DESC {
+        d3d12.INPUT_ELEMENT_DESC {
+            .SemanticName = "POSITION",
+            .SemanticIndex = 0,
+            .Format = .R32G32B32_FLOAT,
+            .InputSlot = 0,
+            .AlignedByteOffset = 0,
+            .InputSlotClass = .PER_VERTEX_DATA,
+            .InstanceDataStepRate = 0
+        }
+    };
+    var pso_desc = std.mem.zeroes(d3d12.GRAPHICS_PIPELINE_STATE_DESC);
+    pso_desc.InputLayout = .{
+        .pInputElementDescs = &input_element_descs,
+        .NumElements = input_element_descs.len
+    };
+    pso_desc.VS = .{
+        .pShaderBytecode = simple_vs,
+        .BytecodeLength = simple_vs.len
+    };
+    pso_desc.PS = .{
+        .pShaderBytecode = simple_ps,
+        .BytecodeLength = simple_ps.len
+    };
+    pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+    pso_desc.SampleMask = 0xFFFFFFFF;
+    pso_desc.RasterizerState.FillMode = .WIREFRAME;
+    pso_desc.RasterizerState.CullMode = .NONE;
+    pso_desc.DepthStencilState.DepthEnable = w32.TRUE;
+    pso_desc.DepthStencilState.DepthWriteMask = .ALL;
+    pso_desc.DepthStencilState.DepthFunc = .LESS;
+    pso_desc.PrimitiveTopologyType = .TRIANGLE;
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = .R8G8B8A8_UNORM;
+    pso_desc.DSVFormat = zr.Fw.dsv_format;
+    pso_desc.SampleDesc = .{ .Count = 1, .Quality = 0 };
+
+    const rs_desc = d3d12.VERSIONED_ROOT_SIGNATURE_DESC {
+        .Version = d3d12.ROOT_SIGNATURE_VERSION.VERSION_1_1,
+        .u = .{
+            .Desc_1_1 = .{
+                .NumParameters = 1,
+                .pParameters = &[_]d3d12.ROOT_PARAMETER1 {
+                    .{
+                        .ParameterType = .CBV,
+                        .u = .{
+                            .Descriptor = .{
+                                .ShaderRegister = 0,
+                                .RegisterSpace = 0,
+                                .Flags = d3d12.ROOT_DESCRIPTOR_FLAG_NONE
+                            }
+                        },
+                        .ShaderVisibility = .ALL
+                    }
+                },
+                .NumStaticSamplers = 0,
+                .pStaticSamplers = null,
+                .Flags = d3d12.ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+            }
+        }
+    };
+
+    return try fw.lookupOrCreatePipeline(&pso_desc, null, &rs_desc);
+}
 
 const CbData = struct {
     mvp: [16]f32
@@ -261,11 +335,21 @@ pub fn main() !void {
     const device = fw.getDevice();
     const resource_pool = fw.getResourcePool();
 
+    const simple_pipeline = try create_simple_pipeline(&fw);
     const color_pipeline = try create_color_pipeline(&fw);
     const texture_pipeline = try create_texture_pipeline(&fw);
+
     var vbuf_color = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(VertexWithColor));
     var vbuf_uv = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(VertexWithUv));
     var ibuf = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(u16));
+
+    var torus = zmesh.Shape.initTorus(10, 10, 0.2);
+    defer torus.deinit();
+    const torus_vertex_count = @intCast(u32, torus.positions.len);
+    const torus_index_count = @intCast(u32, torus.indices.len);
+    var vbuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus.positions.len * 3 * @sizeOf(f32)));
+    var ibuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus.indices.len * @sizeOf(u32)));
+
     var needs_upload = true;
     var rotation: f32 = 0.0;
     var last_size_used_for_projection = zr.Size.empty();
@@ -369,19 +453,24 @@ pub fn main() !void {
             fw.addTransitionBarrier(vbuf_color, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.addTransitionBarrier(vbuf_uv, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.addTransitionBarrier(ibuf, d3d12.RESOURCE_STATE_COPY_DEST);
+            fw.addTransitionBarrier(vbuf_torus, d3d12.RESOURCE_STATE_COPY_DEST);
+            fw.addTransitionBarrier(ibuf_torus, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.recordTransitionBarriers();
 
             try fw.uploadBuffer(VertexWithColor, vbuf_color, &vertices_with_color, staging);
             try fw.uploadBuffer(VertexWithUv, vbuf_uv, &vertices_with_uv, staging);
-            const indices = [_]u16 { 0, 1, 2};
-            try fw.uploadBuffer(u16, ibuf, &indices, staging);
+            try fw.uploadBuffer(u16, ibuf, &[_]u16 { 0, 1, 2}, staging);
+            try fw.uploadBuffer([3]f32, vbuf_torus, torus.positions, staging);
+            try fw.uploadBuffer(u32, ibuf_torus, torus.indices, staging);
 
             try fw.uploadTexture2DSimple(texture, image.data, image.bytes_per_component * image.num_components, image.bytes_per_row, staging);
 
             fw.addTransitionBarrier(vbuf_color, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
             fw.addTransitionBarrier(vbuf_uv, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
             fw.addTransitionBarrier(ibuf, d3d12.RESOURCE_STATE_INDEX_BUFFER);
+            fw.addTransitionBarrier(vbuf_torus, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+            fw.addTransitionBarrier(ibuf_torus, d3d12.RESOURCE_STATE_INDEX_BUFFER);
             fw.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_ALL_SHADER_RESOURCE);
             fw.recordTransitionBarriers();
 
@@ -476,6 +565,33 @@ pub fn main() !void {
         });
         cmd_list.DrawIndexedInstanced(3, 1, 0, 0, 0);
 
+        fw.setPipeline(simple_pipeline);
+        cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
+        cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
+            .{
+                .BufferLocation = resource_pool.lookupRef(vbuf_torus).?.resource.GetGPUVirtualAddress(),
+                .SizeInBytes = torus_vertex_count * 3 * @sizeOf(f32),
+                .StrideInBytes = 3 * @sizeOf(f32)
+            }
+        });
+        cmd_list.IASetIndexBuffer(&.{
+            .BufferLocation = resource_pool.lookupRef(ibuf_torus).?.resource.GetGPUVirtualAddress(),
+            .SizeInBytes = torus_index_count * @sizeOf(u32),
+            .Format = .R32_UINT
+        });
+        var torus_cb_data: SimpleCbData = undefined;
+        {
+            const model = zm.mul(zm.rotationY(rotation), zm.translation(0.0, 0.0, 0.0));
+            const modelview = zm.mul(model, view_matrix);
+            const mvp = zm.mul(modelview, projection);
+            zm.storeMat(&torus_cb_data.mvp, zm.transpose(mvp));
+            torus_cb_data.color = [4]f32 { 1.0, 1.0, 1.0, 1.0 };
+            const torus_cb_alloc = try staging.allocate(@sizeOf(SimpleCbData));
+            std.mem.copy(SimpleCbData, torus_cb_alloc.castCpuSlice(SimpleCbData), &[_]SimpleCbData { torus_cb_data });
+            cmd_list.SetGraphicsRootConstantBufferView(0, torus_cb_alloc.gpu_addr);
+        }
+        cmd_list.DrawIndexedInstanced(torus_index_count, 1, 0, 0, 0);
+
         try fw.beginGui(&cbv_srv_uav_pool);
         var demoWindowOpen: bool = true;
         imgui.igShowDemoWindow(&demoWindowOpen);
@@ -493,7 +609,7 @@ pub fn main() !void {
         try fw.endFrame();
 
         if (gui_state.rotate) {
-            rotation += 0.05;
+            rotation += 0.01;
         }
     }
 

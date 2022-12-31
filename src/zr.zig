@@ -780,7 +780,7 @@ pub const Fw = struct {
         window_name: [*:0]const u8 = "zigapp",
         enable_debug_layer: bool = false,
         swap_interval: u32 = 1,
-        staging_area_capacity_per_frame: u32 = 16 * 1024 * 1024,
+        staging_area_capacity_per_frame: u32 = 32 * 1024 * 1024,
         shader_visible_permanent_cbv_srv_uav_heap_range_capacity: u32 = 256,
         shader_visible_per_frame_cbv_srv_uav_heap_range_capacity: u32 = 1024,
         shader_visible_permanent_sampler_heap_range_capacity: u32 = 16,
@@ -2708,6 +2708,15 @@ pub const Fw = struct {
         zstbi.init(self.d.image_arena.allocator());
     }
 
+    const ImageLoadContext = struct {
+        source: [:0]u8,
+        result: *?zstbi.Image
+    };
+
+    fn imageLoaderFunc(ctx: ImageLoadContext) void {
+        ctx.result.* = zstbi.Image.init(ctx.source, 4) catch null; // image arena
+    }
+
     /// Allocates all work data + vertex and index data in the Mesh using the
     /// mesh arena. MeshTexture.image is on the image arena. The other Mesh
     /// data is allocated normally. Missing vertex attributes are filled out
@@ -2881,8 +2890,32 @@ pub const Fw = struct {
             mesh.textures.appendAssumeCapacity(result);
         }
 
+        var threads: std.ArrayList(std.Thread) = std.ArrayList(std.Thread).init(arena);
+        const max_num_threads = @intCast(u32, std.Thread.getCpuCount() catch 4);
+        try threads.ensureTotalCapacity(max_num_threads);
+        image_index = 0;
+        while (image_index < num_images) {
+            var num_threads: u32 = max_num_threads;
+            if (image_index + num_threads > num_images) {
+                num_threads = num_images - image_index;
+            }
+            var t: u32 = 0;
+            while (t < num_threads) : (t += 1) {
+                var ctx = ImageLoadContext {
+                    .source = mesh.textures.items[image_index + t].source,
+                    .result = &mesh.textures.items[image_index + t].image
+                };
+                const thread = std.Thread.spawn(.{}, imageLoaderFunc, .{ ctx }) catch unreachable;
+                threads.appendAssumeCapacity(thread);
+            }
+            for (threads.items) |thread| {
+                thread.join();
+            }
+            threads.clearRetainingCapacity();
+            image_index += num_threads;
+        }
+
         for (mesh.textures.items) |*texture, index| {
-            texture.image = zstbi.Image.init(texture.source, 4) catch null; // image arena
             if (texture.image == null) {
                 std.debug.print("Failed to load glTF texture {}: {s}\n", .{ index, texture.source });
             }

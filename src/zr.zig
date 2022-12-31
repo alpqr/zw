@@ -722,7 +722,7 @@ pub const SubMesh = struct {
 
 pub const MeshTexture = struct {
     source: [:0]u8,
-    image: ?zstbi.Image
+    image: ?zstbi.Image // image arena
 };
 
 const MeshMaterial = struct {
@@ -736,21 +736,23 @@ const MeshMaterial = struct {
 
 pub const Mesh = struct {
     allocator: std.mem.Allocator,
+    source: ?[:0]u8,
     submeshes: std.ArrayList(SubMesh),
-    vertices: std.ArrayList(MeshVertex),
-    indices: std.ArrayList(u32),
+    vertices: std.ArrayList(MeshVertex), // mesh arena
+    indices: std.ArrayList(u32), // mesh arena
     vertex_stride: u32,
     index_stride: u32,
     index_format: dxgi.FORMAT,
     textures: std.ArrayList(MeshTexture),
     materials: std.ArrayList(MeshMaterial),
 
-    pub fn init(allocator: std.mem.Allocator) Mesh {
+    pub fn init(allocator: std.mem.Allocator, mesh_arena: std.mem.Allocator) Mesh {
         return Mesh {
             .allocator = allocator,
+            .source = null,
             .submeshes = std.ArrayList(SubMesh).init(allocator),
-            .vertices = std.ArrayList(MeshVertex).init(allocator),
-            .indices = std.ArrayList(u32).init(allocator),
+            .vertices = std.ArrayList(MeshVertex).init(mesh_arena),
+            .indices = std.ArrayList(u32).init(mesh_arena),
             .vertex_stride = @sizeOf(MeshVertex),
             .index_stride = @sizeOf(u32),
             .index_format = .R32_UINT,
@@ -765,9 +767,10 @@ pub const Mesh = struct {
             self.allocator.free(texture.source);
         }
         self.textures.deinit();
-        self.indices.deinit();
-        self.vertices.deinit();
         self.submeshes.deinit();
+        if (self.source) |s| {
+            self.allocator.free(s);
+        }
     }
 };
 
@@ -882,7 +885,7 @@ pub const Fw = struct {
         sampler_cache_map: std.HashMap(SamplerCacheKey, Descriptor, SamplerCacheHashContext, 80),
         sampler_cpu_pool: CpuDescriptorPool,
         mesh_arena: std.heap.ArenaAllocator,
-        stbi_arena: std.heap.ArenaAllocator,
+        image_arena: std.heap.ArenaAllocator,
     };
 
     allocator: std.mem.Allocator,
@@ -1199,9 +1202,9 @@ pub const Fw = struct {
         zmesh.init(d.mesh_arena.allocator());
         errdefer zmesh.deinit();
 
-        d.stbi_arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer d.stbi_arena.deinit();
-        zstbi.init(d.stbi_arena.allocator());
+        d.image_arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer d.image_arena.deinit();
+        zstbi.init(d.image_arena.allocator());
         errdefer zstbi.deinit();
 
         var self = Fw {
@@ -1252,7 +1255,7 @@ pub const Fw = struct {
         zmesh.deinit();
         self.d.mesh_arena.deinit();
         zstbi.deinit();
-        self.d.stbi_arena.deinit();
+        self.d.image_arena.deinit();
         self.allocator.destroy(self.d);
         w32.ole32.CoUninitialize();
     }
@@ -2694,24 +2697,25 @@ pub const Fw = struct {
         zmesh.init(self.d.mesh_arena.allocator());
     }
 
-    pub fn getStbiArenaAllocator(self: *const Fw) std.mem.Allocator {
-        return self.d.stbi_arena.allocator();
+    pub fn getImageArenaAllocator(self: *const Fw) std.mem.Allocator {
+        return self.d.image_arena.allocator();
     }
 
-    pub fn resetStbiArena(self: *Fw) void {
+    pub fn resetImageArena(self: *Fw) void {
         zstbi.deinit();
-        self.d.stbi_arena.deinit();
-        self.d.stbi_arena = std.heap.ArenaAllocator.init(self.allocator);
-        zstbi.init(self.d.stbi_arena.allocator());
+        self.d.image_arena.deinit();
+        self.d.image_arena = std.heap.ArenaAllocator.init(self.allocator);
+        zstbi.init(self.d.image_arena.allocator());
     }
 
-    /// Allocates all work data using meshArenaAllocator, except for the
-    /// resulting Mesh. (except MeshTexture.image which is on the stbiArena)
-    /// Missing vertex attributes are filled out with zeroes.
+    /// Allocates all work data + vertex and index data in the Mesh using the
+    /// mesh arena. MeshTexture.image is on the image arena. The other Mesh
+    /// data is allocated normally. Missing vertex attributes are filled out
+    /// with zeroes.
     pub fn loadGltf(self: *Fw, gltf_path: [:0]const u8) !Mesh {
         const options = zmesh.gltf.Options {
             .memory = .{
-                // uses self.d.mesh_arena
+                // mesh arena
                 .alloc_func = zmesh.mem.zmeshAllocUser,
                 .free_func = zmesh.mem.zmeshFreeUser
             }
@@ -2719,9 +2723,10 @@ pub const Fw = struct {
         const gltf = try zmesh.gltf.parseFile(options, gltf_path);
         try zmesh.gltf.loadBuffers(options, gltf, gltf_path);
 
-        // the result should not be in the mesh_arena (but all other work data is)
-        var mesh = Mesh.init(self.allocator);
         var arena = self.getMeshArenaAllocator();
+        var mesh = Mesh.init(self.allocator, arena);
+        errdefer mesh.deinit();
+        mesh.source = try std.fmt.allocPrintZ(self.allocator, "{s}", .{ gltf_path });
         var indices = std.ArrayList(u32).init(arena);
         var positions = std.ArrayList([3]f32).init(arena);
         var normals = std.ArrayList([3]f32).init(arena);
@@ -2871,12 +2876,16 @@ pub const Fw = struct {
             });
             var result = MeshTexture {
                 .source = texture_path,
-                .image = zstbi.Image.init(texture_path, 4) catch null
+                .image = null
             };
-            if (result.image == null) {
-                std.debug.print("Failed to load glTF texture {}: {s}\n", .{ image_index, texture_path });
-            }
             mesh.textures.appendAssumeCapacity(result);
+        }
+
+        for (mesh.textures.items) |*texture, index| {
+            texture.image = zstbi.Image.init(texture.source, 4) catch null; // image arena
+            if (texture.image == null) {
+                std.debug.print("Failed to load glTF texture {}: {s}\n", .{ index, texture.source });
+            }
         }
 
         try mesh.materials.ensureTotalCapacity(num_materials);

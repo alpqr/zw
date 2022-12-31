@@ -498,7 +498,7 @@ pub fn main() !void {
     // cpu_handle.ptr += fw.getPermanentShaderVisibleCbvSrvUavHeapRange().descriptor_byte_size;
     // device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
 
-    var torus = zmesh.Shape.initTorus(10, 10, 0.2); // allocates using meshArena
+    var torus = zmesh.Shape.initTorus(10, 10, 0.2); // mesh arena
     const torus_vertex_count = @intCast(u32, torus.positions.len);
     const torus_index_count = @intCast(u32, torus.indices.len);
     var vbuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_vertex_count * 3 * @sizeOf(f32)));
@@ -580,7 +580,7 @@ pub fn main() !void {
             try fw.generateTexture2DMipmaps(texture);
 
             fw.resetMeshArena();
-            fw.resetStbiArena();
+            fw.resetImageArena();
         }
 
         const rtv = fw.getBackBufferCpuDescriptorHandle();

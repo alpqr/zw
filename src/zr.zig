@@ -2966,4 +2966,11 @@ pub const Fw = struct {
 
         return mesh;
     }
+
+    /// use with deferredReleaseCallback() to deferred-release and null out a ?StagingArea
+    pub fn releaseStagingArea(area_opt_ptr: *anyopaque) void {
+        var area_opt = @ptrCast(*?StagingArea, @alignCast(@alignOf(*?StagingArea), area_opt_ptr));
+        area_opt.*.?.deinit();
+        area_opt.* = null;
+    }
 };

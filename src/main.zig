@@ -413,12 +413,6 @@ fn create_gltf_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     return try fw.lookupOrCreatePipeline(&pso_desc, null, &rs_desc);
 }
 
-fn releaseStagingArea(area_opt_ptr: *anyopaque) void {
-    var area_opt = @ptrCast(*?zr.StagingArea, @alignCast(@alignOf(*?zr.StagingArea), area_opt_ptr));
-    area_opt.*.?.deinit();
-    area_opt.* = null;
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -614,7 +608,7 @@ pub fn main() !void {
             fw.resetImageArena();
 
             // can only drop this when we know for sure the command list has finished on the GPU
-            fw.deferredReleaseCallback(releaseStagingArea, &tex_staging_area);
+            fw.deferredReleaseCallback(zr.Fw.releaseStagingArea, &tex_staging_area);
         }
 
         const rtv = fw.getBackBufferCpuDescriptorHandle();

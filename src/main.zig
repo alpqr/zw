@@ -468,8 +468,7 @@ pub fn main() !void {
     sampler_desc.MaxLOD = std.math.floatMax(f32); // mipmapping
     const sampler = try fw.lookupOrCreateSampler(.{ .desc = sampler_desc, .stype = .ShaderVisible });
 
-    var image = try zstbi.Image.init("maps/test.png", 4);
-    defer image.deinit();
+    var image = try zstbi.Image.init("maps/test.png", 4); // goes on the stbiArena
     const image_size = zr.Size { .width = image.width, .height = image.height };
     const texture = try fw.createTexture2DSimple(.R8G8B8A8_UNORM, image_size, zr.mipLevelsForSize(image_size));
     var srv = try cbv_srv_uav_pool.allocate(1);
@@ -499,7 +498,7 @@ pub fn main() !void {
     // cpu_handle.ptr += fw.getPermanentShaderVisibleCbvSrvUavHeapRange().descriptor_byte_size;
     // device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
 
-    var torus = zmesh.Shape.initTorus(10, 10, 0.2); // allocates using fw.mesh_arena
+    var torus = zmesh.Shape.initTorus(10, 10, 0.2); // allocates using meshArena
     const torus_vertex_count = @intCast(u32, torus.positions.len);
     const torus_index_count = @intCast(u32, torus.indices.len);
     var vbuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_vertex_count * 3 * @sizeOf(f32)));
@@ -580,7 +579,8 @@ pub fn main() !void {
 
             try fw.generateTexture2DMipmaps(texture);
 
-            fw.resetMeshArena(); // defer it to here because of the torus
+            fw.resetMeshArena();
+            fw.resetStbiArena();
         }
 
         const rtv = fw.getBackBufferCpuDescriptorHandle();

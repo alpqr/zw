@@ -709,6 +709,72 @@ pub const Camera = struct {
     }
 };
 
+pub const MeshVertex = struct {
+    position: [3]f32,
+    normal: [3]f32,
+    texcoord0: [2]f32,
+    tangent: [4]f32
+};
+comptime { std.debug.assert(@sizeOf([2]MeshVertex) == 96); }
+
+pub const SubMesh = struct {
+    indices_start_index: u32,
+    vertices_start_index: u32,
+    index_count: u32,
+    vertex_count: u32,
+    material_index: u32
+};
+
+pub const MeshTextureFile = struct {
+    path: []u8
+};
+
+const MeshMaterial = struct {
+    base_color: [4]f32,
+    metallic: f32,
+    roughness: f32,
+    base_color_tex_index: ?u32,
+    metallic_roughness_tex_index: ?u32,
+    normal_tex_index: ?u32
+};
+
+pub const Mesh = struct {
+    allocator: std.mem.Allocator,
+    submeshes: std.ArrayList(SubMesh),
+    vertices: std.ArrayList(MeshVertex),
+    indices: std.ArrayList(u32),
+    vertex_stride: u32,
+    index_stride: u32,
+    index_format: dxgi.FORMAT,
+    texture_files: std.ArrayList(MeshTextureFile),
+    materials: std.ArrayList(MeshMaterial),
+
+    pub fn init(allocator: std.mem.Allocator) Mesh {
+        return Mesh {
+            .allocator = allocator,
+            .submeshes = std.ArrayList(SubMesh).init(allocator),
+            .vertices = std.ArrayList(MeshVertex).init(allocator),
+            .indices = std.ArrayList(u32).init(allocator),
+            .vertex_stride = @sizeOf(MeshVertex),
+            .index_stride = @sizeOf(u32),
+            .index_format = .R32_UINT,
+            .texture_files = std.ArrayList(MeshTextureFile).init(allocator),
+            .materials = std.ArrayList(MeshMaterial).init(allocator)
+        };
+    }
+
+    pub fn deinit(self: *Mesh) void {
+        self.materials.deinit();
+        for (self.texture_files.items) |texture_file| {
+            self.allocator.free(texture_file.path);
+        }
+        self.texture_files.deinit();
+        self.indices.deinit();
+        self.vertices.deinit();
+        self.submeshes.deinit();
+    }
+};
+
 pub const Fw = struct {
     pub const Options = struct {
         window_size: Size = .{ .width = 1280, .height = 720 },
@@ -819,6 +885,7 @@ pub const Fw = struct {
         format_work_area: std.ArrayList(u8),
         sampler_cache_map: std.HashMap(SamplerCacheKey, Descriptor, SamplerCacheHashContext, 80),
         sampler_cpu_pool: CpuDescriptorPool,
+        mesh_arena: std.heap.ArenaAllocator,
     };
 
     allocator: std.mem.Allocator,
@@ -843,9 +910,6 @@ pub const Fw = struct {
 
         zstbi.init(allocator);
         errdefer zstbi.deinit();
-
-        zmesh.init(allocator);
-        errdefer zmesh.deinit();
 
         _ = imgui.igCreateContext(null);
         errdefer imgui.igDestroyContext(null);
@@ -1136,6 +1200,11 @@ pub const Fw = struct {
         d.sampler_cpu_pool = try CpuDescriptorPool.init(allocator, device, .SAMPLER);
         errdefer d.sampler_cpu_pool.deinit();
 
+        d.mesh_arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer d.mesh_arena.deinit();
+        zmesh.init(d.mesh_arena.allocator());
+        errdefer zmesh.deinit();
+
         var self = Fw {
             .allocator = allocator,
             .d = d
@@ -1182,6 +1251,7 @@ pub const Fw = struct {
         _ = self.d.dxgiFactory.Release();
         imgui.igDestroyContext(null);
         zmesh.deinit();
+        self.d.mesh_arena.deinit();
         zstbi.deinit();
         self.allocator.destroy(self.d);
         w32.ole32.CoUninitialize();
@@ -2605,11 +2675,226 @@ pub const Fw = struct {
         return std.fmt.bufPrint(self.d.format_work_area.items, fmt, args) catch unreachable;
     }
 
-    pub fn formatTempZ(self: Fw, comptime fmt: []const u8, args: anytype) [:0]const u8 {
+    pub fn formatTempZ(self: *Fw, comptime fmt: []const u8, args: anytype) [:0]const u8 {
         const len = std.fmt.count(fmt ++ "\x00", args);
         if (self.d.format_work_area.items.len < len) {
             self.d.format_work_area.resize(len + 64) catch unreachable;
         }
         return std.fmt.bufPrintZ(self.d.format_work_area.items, fmt, args) catch unreachable;
+    }
+
+    pub fn meshArenaAllocator(self: *const Fw) std.mem.Allocator {
+        return self.d.mesh_arena.allocator();
+    }
+
+    pub fn resetMeshArena(self: *Fw) void {
+        zmesh.deinit();
+        self.d.mesh_arena.deinit();
+        self.d.mesh_arena = std.heap.ArenaAllocator.init(self.allocator);
+        zmesh.init(self.d.mesh_arena.allocator());
+    }
+
+    /// Allocates all work data using meshArenaAllocator, except for the resulting Mesh.
+    /// Missing vertex attributes are filled out with zeroes.
+    pub fn loadGltf(self: *Fw, gltf_path: [:0]const u8) !Mesh {
+        const options = zmesh.gltf.Options {
+            .memory = .{
+                // uses self.d.mesh_arena
+                .alloc_func = zmesh.mem.zmeshAllocUser,
+                .free_func = zmesh.mem.zmeshFreeUser
+            }
+        };
+        const gltf = try zmesh.gltf.parseFile(options, gltf_path);
+        try zmesh.gltf.loadBuffers(options, gltf, gltf_path);
+
+        // the result should not be in the mesh_arena (but all other work data is)
+        var mesh = Mesh.init(self.allocator);
+        var arena = self.meshArenaAllocator();
+        var indices = std.ArrayList(u32).init(arena);
+        var positions = std.ArrayList([3]f32).init(arena);
+        var normals = std.ArrayList([3]f32).init(arena);
+        var texcoords0 = std.ArrayList([2]f32).init(arena);
+        var tangents = std.ArrayList([4]f32).init(arena);
+
+        const num_meshes = @intCast(u32, gltf.meshes_count);
+        const num_materials = @intCast(u32, gltf.materials_count);
+        var mesh_index: u32 = 0;
+        while (mesh_index < num_meshes) : (mesh_index += 1) {
+            const current_mesh = &gltf.meshes.?[mesh_index];
+            const num_submeshes = @intCast(u32, gltf.meshes.?[mesh_index].primitives_count);
+            var submesh_index: u32 = 0;
+            while (submesh_index < num_submeshes) : (submesh_index += 1) {
+                const indices_start_index = indices.items.len;
+                const positions_start_index = positions.items.len;
+                const current_submesh = &current_mesh.primitives[submesh_index];
+                var had_position = false;
+                var had_normal = false;
+                var had_texcoord0 = false;
+                var had_tangent = false;
+                for (current_submesh.attributes[0..current_submesh.attributes_count]) |attrib| {
+                    const accessor = attrib.data;
+                    std.debug.assert(accessor.component_type == .r_32f);
+                    const buffer_view = accessor.buffer_view.?;
+                    std.debug.assert(buffer_view.buffer.data != null);
+                    try positions.ensureTotalCapacity(positions.items.len + accessor.count);
+                    try normals.ensureTotalCapacity(normals.items.len + accessor.count);
+                    try texcoords0.ensureTotalCapacity(texcoords0.items.len + accessor.count);
+                    try tangents.ensureTotalCapacity(tangents.items.len + accessor.count);
+                    var offset = accessor.offset + buffer_view.offset;
+                    var i: u32 = 0;
+                    while (i < accessor.count) : (i += 1) {
+                        const data_addr = @ptrCast([*]const u8, buffer_view.buffer.data) + offset;
+                        if (attrib.type == .position) {
+                            std.debug.assert(accessor.type == .vec3);
+                            positions.appendAssumeCapacity(@ptrCast([*]const [3]f32, @alignCast(4, data_addr))[0]);
+                            had_position = true;
+                        } else if (attrib.type == .normal) {
+                            std.debug.assert(accessor.type == .vec3);
+                            normals.appendAssumeCapacity(@ptrCast([*]const [3]f32, @alignCast(4, data_addr))[0]);
+                            had_normal = true;
+                        } else if (attrib.type == .texcoord) {
+                            std.debug.assert(accessor.type == .vec2);
+                            texcoords0.appendAssumeCapacity(@ptrCast([*]const [2]f32, @alignCast(4, data_addr))[0]);
+                            had_texcoord0 = true;
+                        } else if (attrib.type == .tangent) {
+                            std.debug.assert(accessor.type == .vec4);
+                            tangents.appendAssumeCapacity(@ptrCast([*]const [4]f32, @alignCast(4, data_addr))[0]);
+                            had_tangent = true;
+                        }
+                        offset += if (buffer_view.stride != 0) buffer_view.stride else accessor.stride;
+                    }
+                }
+                std.debug.assert(had_position);
+                {
+                    var i: u32 = 0;
+                    const count = positions.items.len - positions_start_index;
+                    while (i < count) : (i += 1) {
+                        if (!had_normal) {
+                            normals.appendAssumeCapacity([3]f32 { 0.0, 0.0, 0.0 });
+                        }
+                        if (!had_texcoord0) {
+                            texcoords0.appendAssumeCapacity([2]f32 { 0.0, 0.0 });
+                        }
+                        if (!had_tangent) {
+                            tangents.appendAssumeCapacity([4]f32 { 0.0, 0.0, 0.0, 0.0 });
+                        }
+                    }
+                }
+
+                const num_indices: u32 = @intCast(u32, current_submesh.indices.?.count);
+                try indices.ensureTotalCapacity(indices.items.len + num_indices);
+                const accessor = current_submesh.indices.?;
+                const buffer_view = accessor.buffer_view.?;
+                std.debug.assert(buffer_view.buffer.data != null);
+                const data_addr = @alignCast(4, @ptrCast([*]const u8, buffer_view.buffer.data) + accessor.offset + buffer_view.offset);
+                if (accessor.stride == 1) {
+                    std.debug.assert(accessor.component_type == .r_8u);
+                    const src = @ptrCast([*]const u8, data_addr);
+                    var i: u32 = 0;
+                    while (i < num_indices) : (i += 1) {
+                        indices.appendAssumeCapacity(src[i]);
+                    }
+                } else if (accessor.stride == 2) {
+                    std.debug.assert(accessor.component_type == .r_16u);
+                    const src = @ptrCast([*]const u16, data_addr);
+                    var i: u32 = 0;
+                    while (i < num_indices) : (i += 1) {
+                        indices.appendAssumeCapacity(src[i]);
+                    }
+                } else if (accessor.stride == 4) {
+                    std.debug.assert(accessor.component_type == .r_32u);
+                    const src = @ptrCast([*]const u32, data_addr);
+                    var i: u32 = 0;
+                    while (i < num_indices) : (i += 1) {
+                        indices.appendAssumeCapacity(src[i]);
+                    }
+                }
+
+                var material_index: u32 = 0;
+                var assigned_material_index: u32 = std.math.maxInt(u32);
+                while (material_index < num_materials) : (material_index += 1) {
+                    const submesh = &gltf.meshes.?[mesh_index].primitives[submesh_index];
+                    if (submesh.material == &gltf.materials.?[material_index]) {
+                        assigned_material_index = material_index;
+                        break;
+                    }
+                }
+                if (assigned_material_index == std.math.maxInt(u32)) {
+                    continue;
+                }
+                try mesh.submeshes.append(.{
+                    .indices_start_index = @intCast(u32, indices_start_index),
+                    .vertices_start_index = @intCast(u32, positions_start_index),
+                    .index_count = @intCast(u32, indices.items.len - indices_start_index),
+                    .vertex_count = @intCast(u32, positions.items.len - positions_start_index),
+                    .material_index = assigned_material_index
+                });
+            }
+        }
+
+        try mesh.indices.ensureTotalCapacity(indices.items.len);
+        for (indices.items) |index| {
+            mesh.indices.appendAssumeCapacity(index);
+        }
+
+        try mesh.vertices.ensureTotalCapacity(positions.items.len);
+        for (positions.items) |_, index| {
+            mesh.vertices.appendAssumeCapacity(.{
+                .position = positions.items[index],
+                .normal = normals.items[index],
+                .texcoord0 = texcoords0.items[index],
+                .tangent = tangents.items[index]
+            });
+        }
+
+        const num_images = @intCast(u32, gltf.images_count);
+        try mesh.texture_files.ensureTotalCapacity(num_images);
+        var image_index: u32 = 0;
+        while (image_index < num_images) : (image_index += 1) {
+            const image = &gltf.images.?[image_index];
+            const asset_dir = std.fs.path.dirname(gltf_path) orelse ".";
+            const texture_path = try std.fs.path.join(arena, &[_][]const u8 { asset_dir, self.formatTemp("{s}", .{image.uri.?}) });
+            var result = try self.allocator.alloc(u8, texture_path.len);
+            std.mem.copy(u8, result, texture_path);
+            mesh.texture_files.appendAssumeCapacity(.{
+                .path = result
+            });
+        }
+
+        try mesh.materials.ensureTotalCapacity(num_materials);
+        var material_index: u32 = 0;
+        while (material_index < num_materials) : (material_index += 1) {
+            const invalid_image_index = num_images;
+            var base_color_tex_index: u32 = invalid_image_index;
+            var metallic_roughness_tex_index: u32 = invalid_image_index;
+            var normal_tex_index: u32 = invalid_image_index;
+            const gltf_material = &gltf.materials.?[material_index];
+            const mr = &gltf_material.pbr_metallic_roughness;
+            if (gltf_material.has_pbr_metallic_roughness != 0) {
+                image_index = 0;
+                while (image_index < num_images) : (image_index += 1) {
+                    const image = &gltf.images.?[image_index];
+                    if (mr.base_color_texture.texture != null and mr.base_color_texture.texture.?.*.image.?.*.uri == image.uri) {
+                        base_color_tex_index = image_index;
+                    }
+                    if (mr.metallic_roughness_texture.texture != null and mr.metallic_roughness_texture.texture.?.*.image.?.*.uri == image.uri) {
+                        metallic_roughness_tex_index = image_index;
+                    }
+                    if (gltf_material.normal_texture.texture != null and gltf_material.normal_texture.texture.?.*.image.?.*.uri == image.uri) {
+                        normal_tex_index = image_index;
+                    }
+                }
+            }
+            mesh.materials.appendAssumeCapacity(.{
+                .base_color = mr.base_color_factor,
+                .roughness = mr.roughness_factor,
+                .metallic = mr.metallic_factor,
+                .base_color_tex_index = if (base_color_tex_index != invalid_image_index) base_color_tex_index else null,
+                .metallic_roughness_tex_index = if (metallic_roughness_tex_index != invalid_image_index) metallic_roughness_tex_index else null,
+                .normal_tex_index = if (normal_tex_index != invalid_image_index) normal_tex_index else null,
+            });
+        }
+
+        return mesh;
     }
 };

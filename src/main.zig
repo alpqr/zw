@@ -15,6 +15,8 @@ const color_vs = @embedFile("shaders/color.vs.cso");
 const color_ps = @embedFile("shaders/color.ps.cso");
 const texture_vs = @embedFile("shaders/texture.vs.cso");
 const texture_ps = @embedFile("shaders/texture.ps.cso");
+const gltf_vs = @embedFile("shaders/gltf.vs.cso");
+const gltf_ps = @embedFile("shaders/gltf.ps.cso");
 
 const VertexWithColor = struct {
     position: [3]f32,
@@ -322,89 +324,93 @@ fn create_texture_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     return try fw.lookupOrCreatePipeline(&pso_desc, null, &rs_desc);
 }
 
-fn loadGltf(gltf_path: [:0]const u8) zmesh.gltf.Error!*zmesh.gltf.Data {
-    const options = zmesh.gltf.Options {
-        .memory = .{
-            .alloc_func = zmesh.mem.zmeshAllocUser,
-            .free_func = zmesh.mem.zmeshFreeUser
+const GltfCbData = struct {
+    mvp: [16]f32,
+};
+comptime { std.debug.assert(@sizeOf(GltfCbData) == 64); }
+
+fn create_gltf_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
+    const input_element_descs = [_]d3d12.INPUT_ELEMENT_DESC {
+        d3d12.INPUT_ELEMENT_DESC {
+            .SemanticName = "POSITION",
+            .SemanticIndex = 0,
+            .Format = .R32G32B32_FLOAT,
+            .InputSlot = 0,
+            .AlignedByteOffset = 0,
+            .InputSlotClass = .PER_VERTEX_DATA,
+            .InstanceDataStepRate = 0
+        },
+        d3d12.INPUT_ELEMENT_DESC {
+            .SemanticName = "NORMAL",
+            .SemanticIndex = 0,
+            .Format = .R32G32B32_FLOAT,
+            .InputSlot = 0,
+            .AlignedByteOffset = 3 * @sizeOf(f32),
+            .InputSlotClass = .PER_VERTEX_DATA,
+            .InstanceDataStepRate = 0
+        },
+        d3d12.INPUT_ELEMENT_DESC {
+            .SemanticName = "TEXCOORD",
+            .SemanticIndex = 0,
+            .Format = .R32G32_FLOAT,
+            .InputSlot = 0,
+            .AlignedByteOffset = 6 * @sizeOf(f32),
+            .InputSlotClass = .PER_VERTEX_DATA,
+            .InstanceDataStepRate = 0
         }
     };
-    const data = try zmesh.gltf.parseFile(options, gltf_path);
-    errdefer zmesh.gltf.free(data);
-    try zmesh.gltf.loadBuffers(options, data, gltf_path);
-    return data;
-}
+    var pso_desc = std.mem.zeroes(d3d12.GRAPHICS_PIPELINE_STATE_DESC);
+    pso_desc.InputLayout = .{
+        .pInputElementDescs = &input_element_descs,
+        .NumElements = input_element_descs.len
+    };
+    pso_desc.VS = .{
+        .pShaderBytecode = gltf_vs,
+        .BytecodeLength = gltf_vs.len
+    };
+    pso_desc.PS = .{
+        .pShaderBytecode = gltf_ps,
+        .BytecodeLength = gltf_ps.len
+    };
+    pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+    pso_desc.SampleMask = 0xFFFFFFFF;
+    pso_desc.RasterizerState.FillMode = .WIREFRAME;
+    pso_desc.RasterizerState.CullMode = .NONE;
+    pso_desc.DepthStencilState.DepthEnable = w32.TRUE;
+    pso_desc.DepthStencilState.DepthWriteMask = .ALL;
+    pso_desc.DepthStencilState.DepthFunc = .LESS;
+    pso_desc.PrimitiveTopologyType = .TRIANGLE;
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = .R8G8B8A8_UNORM;
+    pso_desc.DSVFormat = zr.Fw.dsv_format;
+    pso_desc.SampleDesc = .{ .Count = 1, .Quality = 0 };
 
-fn copySubMeshData(
-    data: *zmesh.gltf.Data,
-    mesh_index: u32,
-    submesh_index: u32,
-    indices: *std.ArrayList(u32),
-    positions: *std.ArrayList([3]f32),
-    normals: *std.ArrayList([3]f32),
-    texcoords0: *std.ArrayList([2]f32),
-) !void {
-    std.debug.assert(mesh_index < data.meshes_count);
-    std.debug.assert(submesh_index < data.meshes.?[mesh_index].primitives_count);
-    const mesh = &data.meshes.?[mesh_index];
-    const submesh = &mesh.primitives[submesh_index];
-
-    {
-        const num_indices: u32 = @intCast(u32, submesh.indices.?.count);
-        try indices.ensureTotalCapacity(indices.items.len + num_indices);
-        const accessor = submesh.indices.?;
-        const buffer_view = accessor.buffer_view.?;
-        std.debug.assert(buffer_view.buffer.data != null);
-        const data_addr = @alignCast(4, @ptrCast([*]const u8, buffer_view.buffer.data) + accessor.offset + buffer_view.offset);
-        if (accessor.stride == 1) {
-            std.debug.assert(accessor.component_type == .r_8u);
-            const src = @ptrCast([*]const u8, data_addr);
-            var i: u32 = 0;
-            while (i < num_indices) : (i += 1) {
-                indices.appendAssumeCapacity(src[i]);
-            }
-        } else if (accessor.stride == 2) {
-            std.debug.assert(accessor.component_type == .r_16u);
-            const src = @ptrCast([*]const u16, data_addr);
-            var i: u32 = 0;
-            while (i < num_indices) : (i += 1) {
-                indices.appendAssumeCapacity(src[i]);
-            }
-        } else if (accessor.stride == 4) {
-            std.debug.assert(accessor.component_type == .r_32u);
-            const src = @ptrCast([*]const u32, data_addr);
-            var i: u32 = 0;
-            while (i < num_indices) : (i += 1) {
-                indices.appendAssumeCapacity(src[i]);
+    const rs_desc = d3d12.VERSIONED_ROOT_SIGNATURE_DESC {
+        .Version = d3d12.ROOT_SIGNATURE_VERSION.VERSION_1_1,
+        .u = .{
+            .Desc_1_1 = .{
+                .NumParameters = 1,
+                .pParameters = &[_]d3d12.ROOT_PARAMETER1 {
+                    .{
+                        .ParameterType = .CBV,
+                        .u = .{
+                            .Descriptor = .{
+                                .ShaderRegister = 0,
+                                .RegisterSpace = 0,
+                                .Flags = d3d12.ROOT_DESCRIPTOR_FLAG_NONE
+                            }
+                        },
+                        .ShaderVisibility = .ALL
+                    }
+                },
+                .NumStaticSamplers = 0,
+                .pStaticSamplers = null,
+                .Flags = d3d12.ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
             }
         }
-    }
+    };
 
-    for (submesh.attributes[0..submesh.attributes_count]) |attrib| {
-        const accessor = attrib.data;
-        std.debug.assert(accessor.component_type == .r_32f);
-        const buffer_view = accessor.buffer_view.?;
-        std.debug.assert(buffer_view.buffer.data != null);
-        try positions.ensureTotalCapacity(positions.items.len + accessor.count);
-        try normals.ensureTotalCapacity(normals.items.len + accessor.count);
-        try texcoords0.ensureTotalCapacity(texcoords0.items.len + accessor.count);
-        var offset = accessor.offset + buffer_view.offset;
-        var i: u32 = 0;
-        while (i < accessor.count) : (i += 1) {
-            const data_addr = @ptrCast([*]const u8, buffer_view.buffer.data) + offset;
-            if (attrib.type == .position) {
-                std.debug.assert(accessor.type == .vec3);
-                positions.appendAssumeCapacity(@ptrCast([*]const [3]f32, @alignCast(4, data_addr))[0]);
-            } else if (attrib.type == .normal) {
-                std.debug.assert(accessor.type == .vec3);
-                normals.appendAssumeCapacity(@ptrCast([*]const [3]f32, @alignCast(4, data_addr))[0]);
-            } else if (attrib.type == .texcoord) {
-                std.debug.assert(accessor.type == .vec2);
-                texcoords0.appendAssumeCapacity(@ptrCast([*]const [2]f32, @alignCast(4, data_addr))[0]);
-            }
-            offset += if (buffer_view.stride != 0) buffer_view.stride else accessor.stride;
-        }
-    }
+    return try fw.lookupOrCreatePipeline(&pso_desc, null, &rs_desc);
 }
 
 pub fn main() !void {
@@ -423,6 +429,7 @@ pub fn main() !void {
     const simple_pipeline = try create_simple_pipeline(&fw);
     const color_pipeline = try create_color_pipeline(&fw);
     const texture_pipeline = try create_texture_pipeline(&fw);
+    const gltf_pipeline = try create_gltf_pipeline(&fw);
 
     var vbuf_color = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(VertexWithColor));
     var vbuf_uv = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(VertexWithUv));
@@ -492,110 +499,19 @@ pub fn main() !void {
     // cpu_handle.ptr += fw.getPermanentShaderVisibleCbvSrvUavHeapRange().descriptor_byte_size;
     // device.CopyDescriptorsSimple(1, cpu_handle, srv.cpu_handle, .CBV_SRV_UAV);
 
-    var gltf = try loadGltf("models/duck/Duck.gltf");
-    defer zmesh.gltf.free(gltf);
-
-    const SubMesh = struct {
-        indices_start_index: u32,
-        vertex_start_index: u32,
-        num_indices: u32,
-        num_vertices: u32,
-        material_index: u32
-    };
-
-    const MeshVertex = struct {
-        position: [3]f32,
-        // normal: [3]f32,
-        // texcoords0: [2]f32,
-    };
-
-    var submeshes = std.ArrayList(SubMesh).init(allocator);
-    defer submeshes.deinit();
-    var mesh_vertices = std.ArrayList(MeshVertex).init(allocator);
-    defer mesh_vertices.deinit();
-    var mesh_indices = std.ArrayList(u32).init(allocator);
-    defer mesh_indices.deinit();
-
-    {
-        var arena_allocator = std.heap.ArenaAllocator.init(allocator);
-        defer arena_allocator.deinit();
-        const arena = arena_allocator.allocator();
-
-        var indices = std.ArrayList(u32).init(arena);
-        var positions = std.ArrayList([3]f32).init(arena);
-        var normals = std.ArrayList([3]f32).init(arena);
-        var texcoords0 = std.ArrayList([2]f32).init(arena);
-
-        const num_meshes = @intCast(u32, gltf.meshes_count);
-        const num_materials = @intCast(u32, gltf.materials_count);
-
-        var mesh_index: u32 = 0;
-        while (mesh_index < num_meshes) : (mesh_index += 1) {
-            const num_submeshes = @intCast(u32, gltf.meshes.?[mesh_index].primitives_count);
-            var submesh_index: u32 = 0;
-            while (submesh_index < num_submeshes) : (submesh_index += 1) {
-                const indices_start_index = indices.items.len;
-                const positions_start_index = positions.items.len;
-
-                try copySubMeshData(
-                    gltf,
-                    mesh_index,
-                    submesh_index,
-                    &indices,
-                    &positions,
-                    &normals,
-                    &texcoords0
-                );
-
-                var material_index: u32 = 0;
-                var assigned_material_index: u32 = std.math.maxInt(u32);
-                while (material_index < num_materials) : (material_index += 1) {
-                    const submesh = &gltf.meshes.?[mesh_index].primitives[submesh_index];
-                    if (submesh.material == &gltf.materials.?[material_index]) {
-                        assigned_material_index = material_index;
-                        break;
-                    }
-                }
-                if (assigned_material_index == std.math.maxInt(u32)) {
-                    continue;
-                }
-                try submeshes.append(.{
-                    .indices_start_index = @intCast(u32, indices_start_index),
-                    .vertex_start_index = @intCast(u32, positions_start_index),
-                    .num_indices = @intCast(u32, indices.items.len - indices_start_index),
-                    .num_vertices = @intCast(u32, positions.items.len - positions_start_index),
-                    .material_index = assigned_material_index,
-                });
-            }
-        }
-
-        try mesh_indices.ensureTotalCapacity(indices.items.len);
-        for (indices.items) |index| {
-            mesh_indices.appendAssumeCapacity(index);
-        }
-
-        try mesh_vertices.ensureTotalCapacity(positions.items.len);
-        for (positions.items) |_, index| {
-            mesh_vertices.appendAssumeCapacity(.{
-                .position = positions.items[index],
-                // .normal = normals.items[index],
-                // .texcoords0 = texcoords0.items[index],
-            });
-        }
-    }
-
-    // the torus is now a duck
-    const torus_vertex_count = submeshes.items[0].num_vertices;
-    const torus_index_count = submeshes.items[0].num_indices;
+    var torus = zmesh.Shape.initTorus(10, 10, 0.2); // allocates using fw.mesh_arena
+    const torus_vertex_count = @intCast(u32, torus.positions.len);
+    const torus_index_count = @intCast(u32, torus.indices.len);
     var vbuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_vertex_count * 3 * @sizeOf(f32)));
     var ibuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_index_count * @sizeOf(u32)));
 
-    // var torus = zmesh.Shape.initTorus(10, 10, 0.2);
-    // defer torus.deinit();
-    // const torus_vertex_count = @intCast(u32, torus.positions.len);
-    // const torus_index_count = @intCast(u32, torus.indices.len);
-    // var vbuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_vertex_count * 3 * @sizeOf(f32)));
-    // var ibuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_index_count * @sizeOf(u32)));
+    //var gltf_mesh = try fw.loadGltf("models/duck/Duck.gltf");
+    var gltf_mesh = try fw.loadGltf("models/sponza/Sponza.gltf");
+    defer gltf_mesh.deinit();
+    const gltf_vertex_count = @intCast(u32, gltf_mesh.vertices.items.len);
+    const gltf_index_count = @intCast(u32, gltf_mesh.indices.items.len);
+    var vbuf_gltf = try fw.createBuffer(.DEFAULT, gltf_vertex_count * gltf_mesh.vertex_stride);
+    var ibuf_gltf = try fw.createBuffer(.DEFAULT, gltf_index_count * gltf_mesh.index_stride);
 
     var camera = zr.Camera { };
     const GuiState = struct {
@@ -635,6 +551,8 @@ pub fn main() !void {
             fw.addTransitionBarrier(ibuf, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.addTransitionBarrier(vbuf_torus, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.addTransitionBarrier(ibuf_torus, d3d12.RESOURCE_STATE_COPY_DEST);
+            fw.addTransitionBarrier(vbuf_gltf, d3d12.RESOURCE_STATE_COPY_DEST);
+            fw.addTransitionBarrier(ibuf_gltf, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_COPY_DEST);
             fw.recordTransitionBarriers();
 
@@ -642,8 +560,11 @@ pub fn main() !void {
             try fw.uploadBuffer(VertexWithUv, vbuf_uv, &vertices_with_uv, staging);
             try fw.uploadBuffer(u16, ibuf, &[_]u16 { 0, 1, 2}, staging);
 
-            try fw.uploadBuffer(MeshVertex, vbuf_torus, mesh_vertices.items[submeshes.items[0].vertex_start_index..submeshes.items[0].vertex_start_index + submeshes.items[0].num_vertices], staging);
-            try fw.uploadBuffer(u32, ibuf_torus, mesh_indices.items[submeshes.items[0].indices_start_index..submeshes.items[0].indices_start_index + submeshes.items[0].num_indices], staging);
+            try fw.uploadBuffer([3]f32, vbuf_torus, torus.positions, staging);
+            try fw.uploadBuffer(u32, ibuf_torus, torus.indices, staging);
+
+            try fw.uploadBuffer(zr.MeshVertex, vbuf_gltf, gltf_mesh.vertices.items[0..], staging);
+            try fw.uploadBuffer(u32, ibuf_gltf, gltf_mesh.indices.items[0..], staging);
 
             try fw.uploadTexture2DSimple(texture, image.data, image.bytes_per_component * image.num_components, image.bytes_per_row, staging);
 
@@ -652,10 +573,14 @@ pub fn main() !void {
             fw.addTransitionBarrier(ibuf, d3d12.RESOURCE_STATE_INDEX_BUFFER);
             fw.addTransitionBarrier(vbuf_torus, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
             fw.addTransitionBarrier(ibuf_torus, d3d12.RESOURCE_STATE_INDEX_BUFFER);
+            fw.addTransitionBarrier(vbuf_gltf, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+            fw.addTransitionBarrier(ibuf_gltf, d3d12.RESOURCE_STATE_INDEX_BUFFER);
             fw.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_ALL_SHADER_RESOURCE);
             fw.recordTransitionBarriers();
 
             try fw.generateTexture2DMipmaps(texture);
+
+            fw.resetMeshArena(); // defer it to here because of the torus
         }
 
         const rtv = fw.getBackBufferCpuDescriptorHandle();
@@ -755,8 +680,7 @@ pub fn main() !void {
         var torus_cb_data: SimpleCbData = undefined;
         const torus_cb_alloc = try staging.allocate(@sizeOf(SimpleCbData));
         {
-            var model = zm.mul(zm.rotationY(-rotation), zm.translation(0.0, 0.0, 0.0));
-            model = zm.mul(zm.scaling(0.01, 0.01, 0.01), model); // duck
+            const model = zm.mul(zm.rotationY(-rotation), zm.translation(0.0, 0.0, 0.0));
             const modelview = zm.mul(model, view_matrix);
             const mvp = zm.mul(modelview, projection);
             zm.storeMat(&torus_cb_data.mvp, zm.transpose(mvp));
@@ -765,6 +689,36 @@ pub fn main() !void {
         }
         cmd_list.SetGraphicsRootConstantBufferView(0, torus_cb_alloc.gpu_addr);
         cmd_list.DrawIndexedInstanced(torus_index_count, 1, 0, 0, 0);
+
+        fw.setPipeline(gltf_pipeline);
+        var gltf_cb_data: GltfCbData = undefined;
+        const gltf_cb_alloc = try staging.allocate(@sizeOf(GltfCbData));
+        {
+            var model = zm.mul(zm.rotationY(-rotation), zm.translation(0.0, 2.0, 0.0));
+            model = zm.mul(zm.scaling(0.01, 0.01, 0.01), model);
+            const modelview = zm.mul(model, view_matrix);
+            const mvp = zm.mul(modelview, projection);
+            zm.storeMat(&gltf_cb_data.mvp, zm.transpose(mvp));
+            std.mem.copy(GltfCbData, gltf_cb_alloc.castCpuSlice(GltfCbData), &[_]GltfCbData { gltf_cb_data });
+        }
+        const gltf_vbuf_resource = resource_pool.lookupRef(vbuf_gltf).?.resource;
+        const gltf_ibuf_resource = resource_pool.lookupRef(ibuf_gltf).?.resource;
+        for (gltf_mesh.submeshes.items) |submesh| {
+            cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
+                .{
+                    .BufferLocation = gltf_vbuf_resource.GetGPUVirtualAddress() + submesh.vertices_start_index * gltf_mesh.vertex_stride,
+                    .SizeInBytes = submesh.vertex_count * gltf_mesh.vertex_stride,
+                    .StrideInBytes = gltf_mesh.vertex_stride
+                }
+            });
+            cmd_list.IASetIndexBuffer(&.{
+                .BufferLocation = gltf_ibuf_resource.GetGPUVirtualAddress() + submesh.indices_start_index * gltf_mesh.index_stride,
+                .SizeInBytes = submesh.index_count * gltf_mesh.index_stride,
+                .Format = gltf_mesh.index_format
+            });
+            cmd_list.SetGraphicsRootConstantBufferView(0, gltf_cb_alloc.gpu_addr);
+            cmd_list.DrawIndexedInstanced(submesh.index_count, 1, 0, 0, 0);
+        }
 
         try fw.beginGui(&cbv_srv_uav_pool);
         if (gui_state.demo_window_open) {

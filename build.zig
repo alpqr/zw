@@ -116,6 +116,24 @@ fn buildShaders(b: *std.build.Builder) *std.build.Step {
     dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
 
     dxc_command = makeDxcCmd(
+        "gltf.hlsl",
+        "vsMain",
+        "gltf.vs.cso",
+        "vs",
+        ""
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
+        "gltf.hlsl",
+        "psMain",
+        "gltf.ps.cso",
+        "ps",
+        ""
+    );
+    dxc_step.dependOn(&b.addSystemCommand(&dxc_command).step);
+
+    dxc_command = makeDxcCmd(
         "imgui.hlsl",
         "vsMain",
         "imgui.vs.cso",

@@ -806,14 +806,17 @@ pub const Fw = struct {
     const DeferredReleaseEntry = struct {
         const Type = enum {
             Resource,
-            Pipeline
+            Pipeline,
+            Callback
         };
-        handle: ObjectHandle,
         rtype: Type,
-        frame_slot_to_be_released_in: ?u32,
-        view_pool: ?*CpuDescriptorPool,
-        view_start: ?Descriptor,
-        view_count: ?u32
+        handle: ObjectHandle = ObjectHandle.invalid(),
+        frame_slot_to_be_released_in: ?u32 = null,
+        view_pool: ?*CpuDescriptorPool = null,
+        view_start: ?Descriptor = null,
+        view_count: ?u32 = null,
+        callback_fn: ?*const fn (*anyopaque) void = null,
+        callback_user_data: ?*anyopaque = null
     };
 
     const ImguiWData = struct {
@@ -1587,12 +1590,8 @@ pub const Fw = struct {
     /// from the next endFrame().
     pub fn deferredReleaseResource(self: *Fw, resource_handle: ObjectHandle) void {
         self.d.release_queue.append(.{
-            .handle = resource_handle,
             .rtype = .Resource,
-            .frame_slot_to_be_released_in = null,
-            .view_pool = null,
-            .view_start = null,
-            .view_count = null
+            .handle = resource_handle,
         }) catch { };
     }
 
@@ -1602,20 +1601,27 @@ pub const Fw = struct {
                                             view: Descriptor,
                                             view_count: u32) void {
         self.d.release_queue.append(.{
-            .handle = resource_handle,
             .rtype = .Resource,
-            .frame_slot_to_be_released_in = null,
+            .handle = resource_handle,
             .view_pool = view_pool,
             .view_start = view,
-            .view_count = view_count
+            .view_count = view_count,
         }) catch { };
     }
 
     pub fn deferredReleasePipeline(self: *Fw, pipeline_handle: ObjectHandle) void {
         self.d.release_queue.append(.{
-            .handle = pipeline_handle,
             .rtype = .Pipeline,
+            .handle = pipeline_handle,
             .frame_slot_to_be_released_in = null
+        }) catch { };
+    }
+
+    pub fn deferredReleaseCallback(self: *Fw, f: *const fn (*anyopaque) void, user_data: *anyopaque) void {
+        self.d.release_queue.append(.{
+            .rtype = .Callback,
+            .callback_fn = f,
+            .callback_user_data = user_data
         }) catch { };
     }
 
@@ -1648,6 +1654,9 @@ pub const Fw = struct {
                         },
                         .Pipeline => {
                             self.d.pipeline_pool.remove(e.handle);
+                        },
+                        .Callback => {
+                            e.callback_fn.?(e.callback_user_data.?);
                         }
                     }
                 }

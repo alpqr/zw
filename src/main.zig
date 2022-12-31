@@ -413,6 +413,12 @@ fn create_gltf_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     return try fw.lookupOrCreatePipeline(&pso_desc, null, &rs_desc);
 }
 
+fn releaseStagingArea(area_opt_ptr: *anyopaque) void {
+    var area_opt = @ptrCast(*?zr.StagingArea, @alignCast(@alignOf(*?zr.StagingArea), area_opt_ptr));
+    area_opt.*.?.deinit();
+    area_opt.* = null;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -511,6 +517,20 @@ pub fn main() !void {
     const gltf_index_count = @intCast(u32, gltf_mesh.indices.items.len);
     var vbuf_gltf = try fw.createBuffer(.DEFAULT, gltf_vertex_count * gltf_mesh.vertex_stride);
     var ibuf_gltf = try fw.createBuffer(.DEFAULT, gltf_index_count * gltf_mesh.index_stride);
+    var gltf_texture_objects = std.ArrayList(zr.ObjectHandle).init(allocator);
+    defer gltf_texture_objects.deinit();
+    try gltf_texture_objects.ensureTotalCapacity(gltf_mesh.textures.items.len);
+    for (gltf_mesh.textures.items) |gtex| {
+        if (gtex.image == null) {
+            gltf_texture_objects.appendAssumeCapacity(zr.ObjectHandle.invalid());
+            continue;
+        }
+        const resource_handle = try fw.createTexture2DSimple(.R8G8B8A8_UNORM, zr.Size { .width = gtex.image.?.width, .height = gtex.image.?.height }, 1);
+        gltf_texture_objects.appendAssumeCapacity(resource_handle);
+    }
+    // for glTF models with lots of big textures, the 32 MB per-frame staging is not enough
+    var tex_staging_area: ?zr.StagingArea = try zr.StagingArea.init(device, 512 * 1024 * 1024, .UPLOAD);
+    defer if (tex_staging_area != null) tex_staging_area.?.deinit();
 
     var camera = zr.Camera { };
     const GuiState = struct {
@@ -567,6 +587,17 @@ pub fn main() !void {
 
             try fw.uploadTexture2DSimple(texture, image.data, image.bytes_per_component * image.num_components, image.bytes_per_row, staging);
 
+            for (gltf_texture_objects.items) |handle, index| {
+                if (resource_pool.isValid(handle)) {
+                    fw.addTransitionBarrier(handle, d3d12.RESOURCE_STATE_COPY_DEST);
+                    fw.recordTransitionBarriers();
+                    const im = gltf_mesh.textures.items[index].image.?;
+                    try fw.uploadTexture2DSimple(handle, im.data, im.bytes_per_component * im.num_components, im.bytes_per_row, &tex_staging_area.?);
+                    fw.addTransitionBarrier(handle, d3d12.RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    fw.recordTransitionBarriers();
+                }
+            }
+
             fw.addTransitionBarrier(vbuf_color, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
             fw.addTransitionBarrier(vbuf_uv, d3d12.RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
             fw.addTransitionBarrier(ibuf, d3d12.RESOURCE_STATE_INDEX_BUFFER);
@@ -581,6 +612,9 @@ pub fn main() !void {
 
             fw.resetMeshArena();
             fw.resetImageArena();
+
+            // can only drop this when we know for sure the command list has finished on the GPU
+            fw.deferredReleaseCallback(releaseStagingArea, &tex_staging_area);
         }
 
         const rtv = fw.getBackBufferCpuDescriptorHandle();

@@ -678,7 +678,7 @@ pub fn main() !void {
             .Format = .R32_UINT
         });
         var torus_cb_data: SimpleCbData = undefined;
-        const torus_cb_alloc = try staging.allocate(@sizeOf(SimpleCbData));
+        const torus_cb_alloc = try staging.get(@sizeOf(SimpleCbData));
         {
             const model = zm.mul(zm.rotationY(-rotation), zm.translation(0.0, 0.0, 0.0));
             const modelview = zm.mul(model, view_matrix);
@@ -692,7 +692,7 @@ pub fn main() !void {
 
         fw.setPipeline(gltf_pipeline);
         var gltf_cb_data: GltfCbData = undefined;
-        const gltf_cb_alloc = try staging.allocate(@sizeOf(GltfCbData));
+        const gltf_cb_alloc = try staging.get(@sizeOf(GltfCbData));
         {
             var model = zm.mul(zm.rotationY(-rotation), zm.translation(0.0, 2.0, 0.0));
             model = zm.mul(zm.scaling(0.01, 0.01, 0.01), model);

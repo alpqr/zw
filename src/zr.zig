@@ -110,11 +110,6 @@ pub const DescriptorHeap = struct {
         return self.at(self.size - count);
     }
 
-    pub fn unget(self: *DescriptorHeap, count: u32) void {
-        std.debug.assert(self.size >= count);
-        self.size -= count;
-    }
-
     pub fn at(self: *const DescriptorHeap, index: u32) Descriptor {
         const start_offset = index * self.descriptor_byte_size;
 
@@ -565,7 +560,7 @@ pub const StagingArea = struct {
         _ = self.mem.buffer.Release();
     }
 
-    pub fn allocate(self: *StagingArea, size: u32) !Allocation {
+    pub fn get(self: *StagingArea, size: u32) !Allocation {
         const alloc_size = alignedSize(size, alignment);
         if (self.size + alloc_size > self.capacity) {
             std.debug.print("Failed to allocate {} bytes from staging area of size {}\n",
@@ -1752,7 +1747,7 @@ pub const Fw = struct {
     pub fn uploadBuffer(self: Fw, comptime T: type, resource_handle: ObjectHandle, data: []const T, staging: *StagingArea) !void {
         const res = self.d.resource_pool.lookupRef(resource_handle) orelse return;
         const byte_size = data.len * @sizeOf(T);
-        const alloc = try staging.allocate(@intCast(u32, byte_size));
+        const alloc = try staging.get(@intCast(u32, byte_size));
         std.mem.copy(T, alloc.castCpuSlice(T), data);
         self.d.cmd_list.CopyBufferRegion(res.resource, 0, alloc.buffer, alloc.buffer_offset, byte_size);
     }
@@ -1813,7 +1808,7 @@ pub const Fw = struct {
         self.d.device.GetCopyableFootprints(&tex.desc, 0, 1, 0, &layout, null, null, &required_image_data_size);
         const required_bytes_per_line = layout[0].Footprint.RowPitch; // multiple of 256
         std.debug.assert(data_bytes_per_line <= required_bytes_per_line);
-        const alloc = try staging.allocate(@intCast(u32, required_image_data_size));
+        const alloc = try staging.get(@intCast(u32, required_image_data_size));
         var y: u32 = 0;
         while (y < tex.desc.Height) : (y += 1) {
             const src_begin = y * data_bytes_per_line;
@@ -1983,7 +1978,7 @@ pub const Fw = struct {
                     .texel_height = 1.0 / @intToFloat(f32, level_plus_one_mip_height)
                 }
             };
-            const cbuf = try self.getCurrentStagingArea().allocate(@sizeOf(CBufData));
+            const cbuf = try self.getCurrentStagingArea().get(@sizeOf(CBufData));
             std.mem.copy(CBufData, cbuf.castCpuSlice(CBufData), &cbuf_data);
             self.d.cmd_list.SetComputeRootConstantBufferView(0, cbuf.gpu_addr);
 
@@ -2296,7 +2291,7 @@ pub const Fw = struct {
             .Format = if (@sizeOf(imgui.ImDrawIdx) == 2) .R16_UINT else .R32_UINT
         });
 
-        const cbuf = try self.getCurrentStagingArea().allocate(64);
+        const cbuf = try self.getCurrentStagingArea().get(64);
         const m = [_]f32 { // column major
             2.0 / @intToFloat(f32, self.d.swapchain_size.width), 0.0, 0.0, -1.0,
             0.0, 2.0 / -@intToFloat(f32, self.d.swapchain_size.height), 0.0, 1.0,

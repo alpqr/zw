@@ -459,6 +459,9 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
     var fw = try zr.Fw.init(allocator, zr.Fw.Options {
         .enable_debug_layer = true
     });
@@ -530,8 +533,17 @@ pub fn main() !void {
     var vbuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_vertex_count * 3 * @sizeOf(f32)));
     var ibuf_torus = try fw.createBuffer(.DEFAULT, @intCast(u32, torus_index_count * @sizeOf(u32)));
 
-    //var gltf_mesh = try fw.loadGltf("models/duck/Duck.gltf");
-    var gltf_mesh = try fw.loadGltf("models/sponza/Sponza.gltf");
+    var gltf_source: [:0]const u8 = "models/sponza/Sponza.gltf";
+    //gltf_source = "models/duck/Duck.gltf";
+    //gltf_source = "c:/work/glTF-Sample-Models/2.0/FlightHelmet/glTF/FlightHelmet.gltf";
+    //gltf_source = "C:\\work\\glTF-Sample-Models\\2.0\\Corset\\glTF\\Corset.gltf";
+    //gltf_source = "C:\\work\\glTF-Sample-Models\\2.0\\DamagedHelmet\\glTF\\DamagedHelmet.gltf";
+    if (args.len > 1) {
+        gltf_source = args[1];
+    }
+    const gltf_scale = 0.01;
+
+    var gltf_mesh = try fw.loadGltf(gltf_source);
     defer gltf_mesh.deinit();
     const gltf_vertex_count = @intCast(u32, gltf_mesh.vertices.items.len);
     const gltf_index_count = @intCast(u32, gltf_mesh.indices.items.len);
@@ -577,7 +589,8 @@ pub fn main() !void {
             continue;
         }
 
-        fw.updateCamera(&camera);
+        const beginFrameTimeMs = @floatCast(f32, @intToFloat(f64, fw.getBeginFrameTimeNsecs()) / 1000000.0);
+        fw.updateCamera(&camera, beginFrameTimeMs * 0.01, 0.0025);
         const view_matrix = camera.getViewMatrix();
 
         const output_pixel_size = fw.getBackBufferPixelSize();
@@ -760,7 +773,7 @@ pub fn main() !void {
         const submesh_count = @intCast(u32, gltf_mesh.submeshes.items.len);
         const gltf_one_cb_size = zr.alignedSize(@sizeOf(GltfCbData), 256);
         const gltf_cb_alloc = try staging.get(gltf_one_cb_size * submesh_count);
-        const gltf_model = zm.mul(zm.scaling(0.01, 0.01, 0.01), zm.translation(0.0, 3.0, 0.0));
+        const gltf_model = zm.mul(zm.scaling(gltf_scale, gltf_scale, gltf_scale), zm.translation(0.0, 3.0, 0.0));
         const gltf_modelview = zm.mul(gltf_model, view_matrix);
         const gltf_mvp = zm.transpose(zm.mul(gltf_modelview, projection));
         var submesh_index: u32 = 0;

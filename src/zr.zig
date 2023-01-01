@@ -648,9 +648,9 @@ pub const Camera = struct {
         );
     }
 
-    pub fn rotate(self: *Camera, dx: f32, dy: f32) void {
-        self.pitch += 0.0025 * dy;
-        self.yaw += 0.0025 * dx;
+    pub fn rotate(self: *Camera, dx: f32, dy: f32, speed: f32) void {
+        self.pitch += speed * dy;
+        self.yaw += speed * dx;
         self.pitch = std.math.min(self.pitch, 0.48 * std.math.pi);
         self.pitch = std.math.max(self.pitch, -0.48 * std.math.pi);
         self.yaw = zm.modAngle(self.yaw);
@@ -891,6 +891,8 @@ pub const Fw = struct {
         sampler_cpu_pool: CpuDescriptorPool,
         mesh_arena: std.heap.ArenaAllocator,
         image_arena: std.heap.ArenaAllocator,
+        frame_timer: std.time.Timer,
+        elapsed_begin_to_begin_ns: u64,
     };
 
     allocator: std.mem.Allocator,
@@ -1213,6 +1215,9 @@ pub const Fw = struct {
         errdefer d.image_arena.deinit();
         zstbi.init(d.image_arena.allocator());
         errdefer zstbi.deinit();
+
+        d.frame_timer = std.time.Timer.start() catch unreachable;
+        d.elapsed_begin_to_begin_ns = 0;
 
         var self = Fw {
             .allocator = allocator,
@@ -1546,6 +1551,8 @@ pub const Fw = struct {
         self.d.shader_visible_per_frame_cbv_srv_uav_heap_ranges[self.d.current_frame_slot].reset();
         self.d.shader_visible_per_frame_sampler_heap_ranges[self.d.current_frame_slot].reset();
 
+        self.d.elapsed_begin_to_begin_ns = self.d.frame_timer.lap();
+
         return BeginFrameResult.success;
     }
 
@@ -1568,6 +1575,10 @@ pub const Fw = struct {
 
         self.switchToNextFrameSlot();
         self.d.current_back_buffer_index = self.d.swapchain.GetCurrentBackBufferIndex();
+    }
+
+    pub fn getBeginFrameTimeNsecs(self: *const Fw) u64 {
+        return self.d.elapsed_begin_to_begin_ns;
     }
 
     pub fn setPipeline(self: *Fw, pipeline_handle: ObjectHandle) void {
@@ -2370,7 +2381,6 @@ pub const Fw = struct {
 
     pub fn getDummyTexture(self: *Fw, cpu_cbv_srv_uav_pool: *CpuDescriptorPool) !Descriptor {
         if (!self.d.resource_pool.isValid(self.d.dummy_texture_handle) or self.d.dummy_texture == null) {
-            std.debug.print("create\n", .{});
             self.d.dummy_texture_handle = try self.createTexture2DSimple(.R8G8B8A8_UNORM, .{ .width = 64, .height = 64 }, 1);
             self.addTransitionBarrier(self.d.dummy_texture_handle, d3d12.RESOURCE_STATE_COPY_DEST);
             self.recordTransitionBarriers();
@@ -2656,7 +2666,7 @@ pub const Fw = struct {
         return imgui.igIsWindowFocused(imgui.ImGuiFocusedFlags_AnyWindow);
     }
 
-    pub fn updateCamera(self: *Fw, camera: *Camera) void {
+    pub fn updateCamera(self: *Fw, camera: *Camera, movement_speed: f32, rotate_speed: f32) void {
         if (guiHasFocus()) {
             _ = w32.GetCursorPos(&self.d.camera_wdata.last_cursor_pos);
         } else {
@@ -2666,23 +2676,22 @@ pub const Fw = struct {
             const dy = cursor_pos.y - self.d.camera_wdata.last_cursor_pos.y;
             self.d.camera_wdata.last_cursor_pos = cursor_pos;
             if (w32.GetAsyncKeyState(w32.VK_LBUTTON) < 0) {
-                camera.rotate(@intToFloat(f32, dx), @intToFloat(f32, dy));
+                camera.rotate(@intToFloat(f32, dx), @intToFloat(f32, dy), rotate_speed);
             }
-            const speed: f32 = 0.16;
             if (w32.GetAsyncKeyState('W') < 0) {
-                camera.moveForward(speed);
+                camera.moveForward(movement_speed);
             } else if (w32.GetAsyncKeyState('S') < 0) {
-                camera.moveBackward(speed);
+                camera.moveBackward(movement_speed);
             }
             if (w32.GetAsyncKeyState('D') < 0) {
-                camera.moveRight(speed);
+                camera.moveRight(movement_speed);
             } else if (w32.GetAsyncKeyState('A') < 0) {
-                camera.moveLeft(speed);
+                camera.moveLeft(movement_speed);
             }
             if (w32.GetAsyncKeyState('R') < 0) {
-                camera.moveUp(speed);
+                camera.moveUp(movement_speed);
             } else if (w32.GetAsyncKeyState('F') < 0) {
-                camera.moveDown(speed);
+                camera.moveDown(movement_speed);
             }
         }
     }

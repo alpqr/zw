@@ -66,7 +66,7 @@ const SimpleCbData = struct {
 };
 comptime { std.debug.assert(@sizeOf(SimpleCbData) == 80); }
 
-fn create_simple_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
+fn createSimplePipeline(fw: *zr.Fw) !zr.ObjectHandle {
     const input_element_descs = [_]d3d12.INPUT_ELEMENT_DESC {
         d3d12.INPUT_ELEMENT_DESC {
             .SemanticName = "POSITION",
@@ -137,7 +137,7 @@ const CbData = struct {
 };
 comptime { std.debug.assert(@sizeOf(CbData) == 64); }
 
-fn create_color_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
+fn createColorPipeline(fw: *zr.Fw) !zr.ObjectHandle {
     const input_element_descs = [_]d3d12.INPUT_ELEMENT_DESC {
         d3d12.INPUT_ELEMENT_DESC {
             .SemanticName = "POSITION",
@@ -213,7 +213,7 @@ fn create_color_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     return try fw.lookupOrCreatePipeline(&pso_desc, null, &rs_desc);
 }
 
-fn create_texture_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
+fn createTexturePipeline(fw: *zr.Fw) !zr.ObjectHandle {
     const input_element_descs = [_]d3d12.INPUT_ELEMENT_DESC {
         d3d12.INPUT_ELEMENT_DESC {
             .SemanticName = "POSITION",
@@ -326,10 +326,11 @@ fn create_texture_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
 
 const GltfCbData = struct {
     mvp: [16]f32,
+    base_color: [4]f32
 };
-comptime { std.debug.assert(@sizeOf(GltfCbData) == 64); }
+comptime { std.debug.assert(@sizeOf(GltfCbData) == 80); }
 
-fn create_gltf_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
+fn createGltfPipeline(fw: *zr.Fw) !zr.ObjectHandle {
     const input_element_descs = [_]d3d12.INPUT_ELEMENT_DESC {
         d3d12.INPUT_ELEMENT_DESC {
             .SemanticName = "POSITION",
@@ -358,6 +359,7 @@ fn create_gltf_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
             .InputSlotClass = .PER_VERTEX_DATA,
             .InstanceDataStepRate = 0
         }
+        // tangents are there in the buffer but skipped here
     };
     var pso_desc = std.mem.zeroes(d3d12.GRAPHICS_PIPELINE_STATE_DESC);
     pso_desc.InputLayout = .{
@@ -374,8 +376,9 @@ fn create_gltf_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
     };
     pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
     pso_desc.SampleMask = 0xFFFFFFFF;
-    pso_desc.RasterizerState.FillMode = .WIREFRAME;
-    pso_desc.RasterizerState.CullMode = .NONE;
+    pso_desc.RasterizerState.FillMode = .SOLID;
+    pso_desc.RasterizerState.CullMode = .BACK;
+    pso_desc.RasterizerState.DepthClipEnable = w32.TRUE;
     pso_desc.DepthStencilState.DepthEnable = w32.TRUE;
     pso_desc.DepthStencilState.DepthWriteMask = .ALL;
     pso_desc.DepthStencilState.DepthFunc = .LESS;
@@ -389,18 +392,56 @@ fn create_gltf_pipeline(fw: *zr.Fw) !zr.ObjectHandle {
         .Version = d3d12.ROOT_SIGNATURE_VERSION.VERSION_1_1,
         .u = .{
             .Desc_1_1 = .{
-                .NumParameters = 1,
+                .NumParameters = 3,
                 .pParameters = &[_]d3d12.ROOT_PARAMETER1 {
                     .{
                         .ParameterType = .CBV,
                         .u = .{
                             .Descriptor = .{
-                                .ShaderRegister = 0,
+                                .ShaderRegister = 0, // b0
                                 .RegisterSpace = 0,
                                 .Flags = d3d12.ROOT_DESCRIPTOR_FLAG_NONE
                             }
                         },
                         .ShaderVisibility = .ALL
+                    },
+                    .{
+                        .ParameterType = .DESCRIPTOR_TABLE,
+                        .u = .{
+                            .DescriptorTable = .{
+                                .NumDescriptorRanges = 1,
+                                .pDescriptorRanges = &[_]d3d12.DESCRIPTOR_RANGE1 {
+                                    .{
+                                        .RangeType = .SRV,
+                                        .NumDescriptors = 1,
+                                        .BaseShaderRegister = 0, // t0
+                                        .RegisterSpace = 0,
+                                        .Flags = d3d12.DESCRIPTOR_RANGE_FLAG_NONE,
+                                        .OffsetInDescriptorsFromTableStart = 0
+                                    }
+                                }
+                            }
+                        },
+                        .ShaderVisibility = .PIXEL
+                    },
+                    .{
+                        .ParameterType = .DESCRIPTOR_TABLE,
+                        .u = .{
+                            .DescriptorTable = .{
+                                .NumDescriptorRanges = 1,
+                                .pDescriptorRanges = &[_]d3d12.DESCRIPTOR_RANGE1 {
+                                    .{
+                                        .RangeType = .SAMPLER,
+                                        .NumDescriptors = 1,
+                                        .BaseShaderRegister = 0, // s0
+                                        .RegisterSpace = 0,
+                                        .Flags = d3d12.DESCRIPTOR_RANGE_FLAG_NONE,
+                                        .OffsetInDescriptorsFromTableStart = 0
+                                    }
+                                }
+                            }
+                        },
+                        .ShaderVisibility = .PIXEL
                     }
                 },
                 .NumStaticSamplers = 0,
@@ -426,10 +467,10 @@ pub fn main() !void {
     const device = fw.getDevice();
     const resource_pool = fw.getResourcePool();
 
-    const simple_pipeline = try create_simple_pipeline(&fw);
-    const color_pipeline = try create_color_pipeline(&fw);
-    const texture_pipeline = try create_texture_pipeline(&fw);
-    const gltf_pipeline = try create_gltf_pipeline(&fw);
+    const simple_pipeline = try createSimplePipeline(&fw);
+    const color_pipeline = try createColorPipeline(&fw);
+    const texture_pipeline = try createTexturePipeline(&fw);
+    const gltf_pipeline = try createGltfPipeline(&fw);
 
     var vbuf_color = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(VertexWithColor));
     var vbuf_uv = try fw.createBuffer(.DEFAULT, 3 * @sizeOf(VertexWithUv));
@@ -472,22 +513,7 @@ pub fn main() !void {
     const image_size = zr.Size { .width = image.width, .height = image.height };
     const texture = try fw.createTexture2DSimple(.R8G8B8A8_UNORM, image_size, zr.mipLevelsForSize(image_size));
     var srv = try cbv_srv_uav_pool.allocate(1);
-    device.CreateShaderResourceView(
-        resource_pool.lookupRef(texture).?.resource,
-        &.{
-            .Format = .R8G8B8A8_UNORM,
-            .ViewDimension = .TEXTURE2D,
-            .Shader4ComponentMapping = d3d12.DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            .u = .{
-                .Texture2D = .{
-                    .MostDetailedMip = 0,
-                    .MipLevels = resource_pool.lookupRef(texture).?.desc.MipLevels,
-                    .PlaneSlice = 0,
-                    .ResourceMinLODClamp = 0.0
-                }
-            }
-        },
-        srv.cpu_handle);
+    fw.createSrv2DAllMips(&srv, texture);
 
     // If we didn't want to build the tables in the shader visible heap on every
     // frame it could be done once in the permanent area instead.
@@ -514,6 +540,9 @@ pub fn main() !void {
     var gltf_texture_objects = std.ArrayList(zr.ObjectHandle).init(allocator);
     defer gltf_texture_objects.deinit();
     try gltf_texture_objects.ensureTotalCapacity(gltf_mesh.textures.items.len);
+    var gltf_texture_srvs = std.ArrayList(zr.Descriptor).init(allocator);
+    defer gltf_texture_srvs.deinit();
+    try gltf_texture_srvs.ensureTotalCapacity(gltf_mesh.textures.items.len);
     for (gltf_mesh.textures.items) |gtex| {
         if (gtex.image == null) {
             gltf_texture_objects.appendAssumeCapacity(zr.ObjectHandle.invalid());
@@ -521,10 +550,19 @@ pub fn main() !void {
         }
         const resource_handle = try fw.createTexture2DSimple(.R8G8B8A8_UNORM, zr.Size { .width = gtex.image.?.width, .height = gtex.image.?.height }, 1);
         gltf_texture_objects.appendAssumeCapacity(resource_handle);
+        var gltf_srv = try cbv_srv_uav_pool.allocate(1);
+        fw.createSrv2DNoMips(&gltf_srv, resource_handle);
+        gltf_texture_srvs.appendAssumeCapacity(gltf_srv);
     }
     // for glTF models with lots of big textures, the 32 MB per-frame staging is not enough
     var tex_staging_area: ?zr.StagingArea = try zr.StagingArea.init(device, 512 * 1024 * 1024, .UPLOAD);
     defer if (tex_staging_area != null) tex_staging_area.?.deinit();
+    var gltf_sampler_desc = std.mem.zeroes(d3d12.SAMPLER_DESC);
+    gltf_sampler_desc.Filter = .MIN_MAG_MIP_LINEAR;
+    gltf_sampler_desc.AddressU = .WRAP;
+    gltf_sampler_desc.AddressV = .WRAP;
+    gltf_sampler_desc.AddressW = .WRAP;
+    const gltf_sampler = try fw.lookupOrCreateSampler(.{ .desc = gltf_sampler_desc, .stype = .ShaderVisible });
 
     var camera = zr.Camera { };
     const GuiState = struct {
@@ -719,19 +757,24 @@ pub fn main() !void {
         cmd_list.DrawIndexedInstanced(torus_index_count, 1, 0, 0, 0);
 
         fw.setPipeline(gltf_pipeline);
-        var gltf_cb_data: GltfCbData = undefined;
-        const gltf_cb_alloc = try staging.get(@sizeOf(GltfCbData));
-        {
-            var model = zm.mul(zm.rotationY(-rotation), zm.translation(0.0, 2.0, 0.0));
-            model = zm.mul(zm.scaling(0.01, 0.01, 0.01), model);
-            const modelview = zm.mul(model, view_matrix);
-            const mvp = zm.mul(modelview, projection);
-            zm.storeMat(&gltf_cb_data.mvp, zm.transpose(mvp));
-            std.mem.copy(GltfCbData, gltf_cb_alloc.castCpuSlice(GltfCbData), &[_]GltfCbData { gltf_cb_data });
+        const submesh_count = @intCast(u32, gltf_mesh.submeshes.items.len);
+        const gltf_one_cb_size = zr.alignedSize(@sizeOf(GltfCbData), 256);
+        const gltf_cb_alloc = try staging.get(gltf_one_cb_size * submesh_count);
+        const gltf_model = zm.mul(zm.scaling(0.01, 0.01, 0.01), zm.translation(0.0, 3.0, 0.0));
+        const gltf_modelview = zm.mul(gltf_model, view_matrix);
+        const gltf_mvp = zm.transpose(zm.mul(gltf_modelview, projection));
+        var submesh_index: u32 = 0;
+        while (submesh_index < submesh_count) : (submesh_index += 1) {
+            const material = gltf_mesh.materials.items[gltf_mesh.submeshes.items[submesh_index].material_index];
+            var gltf_cb_data: GltfCbData = undefined;
+            zm.storeMat(&gltf_cb_data.mvp, gltf_mvp);
+            gltf_cb_data.base_color = material.base_color;
+            std.mem.copy(u8, gltf_cb_alloc.cpu_slice[gltf_one_cb_size * submesh_index..], std.mem.asBytes(&gltf_cb_data));
         }
         const gltf_vbuf_resource = resource_pool.lookupRef(vbuf_gltf).?.resource;
         const gltf_ibuf_resource = resource_pool.lookupRef(ibuf_gltf).?.resource;
-        for (gltf_mesh.submeshes.items) |submesh| {
+        for (gltf_mesh.submeshes.items) |submesh, index| {
+            const material = gltf_mesh.materials.items[submesh.material_index];
             cmd_list.IASetVertexBuffers(0, 1, &[_]d3d12.VERTEX_BUFFER_VIEW {
                 .{
                     .BufferLocation = gltf_vbuf_resource.GetGPUVirtualAddress() + submesh.vertices_start_index * gltf_mesh.vertex_stride,
@@ -744,7 +787,14 @@ pub fn main() !void {
                 .SizeInBytes = submesh.index_count * gltf_mesh.index_stride,
                 .Format = gltf_mesh.index_format
             });
-            cmd_list.SetGraphicsRootConstantBufferView(0, gltf_cb_alloc.gpu_addr);
+            cmd_list.SetGraphicsRootConstantBufferView(0, gltf_cb_alloc.gpu_addr + gltf_one_cb_size * index);
+            const base_color_tex_srv_cpu = if (material.base_color_tex_index) |base_color_tex_index|
+                gltf_texture_srvs.items[base_color_tex_index]
+                else try fw.getDummyTexture(&cbv_srv_uav_pool);
+            const base_color_tex_srv_gpu = try shader_visible_cbv_srv_uav_heap.get(1);
+            device.CopyDescriptorsSimple(1, base_color_tex_srv_gpu.cpu_handle, base_color_tex_srv_cpu.cpu_handle, .CBV_SRV_UAV);
+            cmd_list.SetGraphicsRootDescriptorTable(1, base_color_tex_srv_gpu.gpu_handle);
+            cmd_list.SetGraphicsRootDescriptorTable(2, gltf_sampler.gpu_handle);
             cmd_list.DrawIndexedInstanced(submesh.index_count, 1, 0, 0, 0);
         }
 

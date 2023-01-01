@@ -884,6 +884,8 @@ pub const Fw = struct {
         imgui_wdata: ImguiWData,
         camera_wdata: CameraWData,
         mipmapgen_pipeline: ObjectHandle,
+        dummy_texture_handle: ObjectHandle,
+        dummy_texture: ?Descriptor,
         format_work_area: std.ArrayList(u8),
         sampler_cache_map: std.HashMap(SamplerCacheKey, Descriptor, SamplerCacheHashContext, 80),
         sampler_cpu_pool: CpuDescriptorPool,
@@ -1193,6 +1195,8 @@ pub const Fw = struct {
         d.imgui_wdata = ImguiWData { };
         d.camera_wdata = CameraWData.init();
         d.mipmapgen_pipeline = ObjectHandle.invalid();
+        d.dummy_texture_handle = ObjectHandle.invalid();
+        d.dummy_texture = null;
 
         d.format_work_area = std.ArrayList(u8).init(allocator);
 
@@ -1815,7 +1819,7 @@ pub const Fw = struct {
 
     pub fn uploadTexture2DSimple(self: *Fw,
                                  texture: ObjectHandle,
-                                 data: []u8,
+                                 data: []const u8,
                                  data_bytes_per_pixel: u32,
                                  data_bytes_per_line: u32,
                                  staging: *StagingArea) !void {
@@ -1859,6 +1863,35 @@ pub const Fw = struct {
                 }
             },
             null);
+    }
+
+    pub fn createSrv2D(self: *Fw, dst: *Descriptor, texture: ObjectHandle, most_detailed_mip: u32, mip_levels: u32) void {
+        const tex = self.d.resource_pool.lookupRef(texture) orelse return;
+        self.d.device.CreateShaderResourceView(
+            tex.resource,
+            &.{
+                .Format = tex.desc.Format,
+                .ViewDimension = .TEXTURE2D,
+                .Shader4ComponentMapping = d3d12.DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                .u = .{
+                    .Texture2D = .{
+                        .MostDetailedMip = most_detailed_mip,
+                        .MipLevels = mip_levels,
+                        .PlaneSlice = 0,
+                        .ResourceMinLODClamp = 0.0
+                    }
+                }
+            },
+            dst.cpu_handle);
+    }
+
+    pub fn createSrv2DNoMips(self: *Fw, dst: *Descriptor, texture: ObjectHandle) void {
+        return self.createSrv2D(dst, texture, 0, 1);
+    }
+
+    pub fn createSrv2DAllMips(self: *Fw, dst: *Descriptor, texture: ObjectHandle) void {
+        const tex = self.d.resource_pool.lookupRef(texture) orelse return;
+        return self.createSrv2D(dst, texture, 0, tex.desc.MipLevels);
     }
 
     pub fn generateTexture2DMipmaps(self: *Fw, texture: ObjectHandle) !void {
@@ -1999,22 +2032,8 @@ pub const Fw = struct {
             std.mem.copy(CBufData, cbuf.castCpuSlice(CBufData), &cbuf_data);
             self.d.cmd_list.SetComputeRootConstantBufferView(0, cbuf.gpu_addr);
 
-            const srv = try self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(1);
-            self.d.device.CreateShaderResourceView(
-                texture_res.resource, &.{
-                    .Format = texture_res.desc.Format,
-                    .ViewDimension = .TEXTURE2D,
-                    .Shader4ComponentMapping = d3d12.DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    .u = .{
-                        .Texture2D = .{
-                            .MostDetailedMip = level,
-                            .MipLevels = 1,
-                            .PlaneSlice = 0,
-                            .ResourceMinLODClamp = 0.0
-                        }
-                    }
-                },
-                srv.cpu_handle);
+            var srv = try self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(1);
+            self.createSrv2D(&srv, texture, level, 1);
             self.d.cmd_list.SetComputeRootDescriptorTable(1, srv.gpu_handle);
 
             const uav_table_start = try self.getCurrentShaderVisibleCbvSrvUavHeapRange().get(4);
@@ -2085,22 +2104,7 @@ pub const Fw = struct {
                                                            .{ .width = @intCast(u32, w), .height = @intCast(u32, h) },
                                                            1);
             var srv = try cpu_cbv_srv_uav_pool.allocate(1);
-            self.d.device.CreateShaderResourceView(
-                self.d.resource_pool.lookupRef(texture).?.resource,
-                &.{
-                    .Format = .R8G8B8A8_UNORM,
-                    .ViewDimension = .TEXTURE2D,
-                    .Shader4ComponentMapping = d3d12.DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    .u = .{
-                        .Texture2D = .{
-                            .MostDetailedMip = 0,
-                            .MipLevels = 1,
-                            .PlaneSlice = 0,
-                            .ResourceMinLODClamp = 0.0
-                        }
-                    }
-                },
-                srv.cpu_handle);
+            self.createSrv2DNoMips(&srv, texture);
             const pixels = p[0..@intCast(usize, w * h * 4)];
             self.addTransitionBarrier(texture, d3d12.RESOURCE_STATE_COPY_DEST);
             self.recordTransitionBarriers();
@@ -2362,6 +2366,22 @@ pub const Fw = struct {
         v.key_ptr.* = key;
         v.value_ptr.* = sampler_alloc;
         return sampler_alloc;
+    }
+
+    pub fn getDummyTexture(self: *Fw, cpu_cbv_srv_uav_pool: *CpuDescriptorPool) !Descriptor {
+        if (!self.d.resource_pool.isValid(self.d.dummy_texture_handle) or self.d.dummy_texture == null) {
+            std.debug.print("create\n", .{});
+            self.d.dummy_texture_handle = try self.createTexture2DSimple(.R8G8B8A8_UNORM, .{ .width = 64, .height = 64 }, 1);
+            self.addTransitionBarrier(self.d.dummy_texture_handle, d3d12.RESOURCE_STATE_COPY_DEST);
+            self.recordTransitionBarriers();
+            const dummy_image = [_]u8 { 255 } ** (64 * 64 * 4);
+            try self.uploadTexture2DSimple(self.d.dummy_texture_handle, &dummy_image, 4, 64 * 4, self.getCurrentStagingArea());
+            self.addTransitionBarrier(self.d.dummy_texture_handle, d3d12.RESOURCE_STATE_ALL_SHADER_RESOURCE);
+            self.recordTransitionBarriers();
+            self.d.dummy_texture = try cpu_cbv_srv_uav_pool.allocate(1);
+            self.createSrv2DNoMips(&self.d.dummy_texture.?, self.d.dummy_texture_handle);
+        }
+        return self.d.dummy_texture.?;
     }
 
     fn isVkKeyDown(vk: c_int) bool {

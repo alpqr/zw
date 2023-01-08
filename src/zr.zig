@@ -194,8 +194,8 @@ pub const CpuDescriptorPool = struct {
                         const first_index = i - (free_count - 1);
                         var j: u32 = 0;
                         while (j < count) : (j + 1) {
-                            last.map.set(first_index + j);
-                            return last.heap.at(first_index);
+                            h.map.set(first_index + j);
+                            return h.heap.at(first_index);
                         }
                     }
                 }
